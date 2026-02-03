@@ -190,7 +190,6 @@ pre_start <- "2024-01-01"
 pre_end   <- "2024-05-31"
 
 # Data that goes into best_matches = treated + control
-
 sales_data <- sales_data %>%
   mutate(date = ymd(date))
 
@@ -198,8 +197,9 @@ treat_df   <- sales_data %>% filter(treat == 1)
 
 control_df <- sales_data %>% filter(treat == 0)
 
+# If you want to specify dates
 synthetic_panel <- build_synthetic_control(
-  data           = sales_data,
+  data           = sales_data2,
   matching_metric = "sales",
   date_col        = "date",
   city_col        = "city",
@@ -207,6 +207,18 @@ synthetic_panel <- build_synthetic_control(
   match_window    = c("2024-01-01", "2024-05-31"),   # your pre-period
   n_matches       = 3
 )
+
+# If you use an indicotor
+synthetic_panel <- build_synthetic_control(
+  data           = sales_data2,
+  matching_metric = "sales",
+  date_col        = "date",
+  city_col        = "city",
+  treat_col       = "treat",
+  intervention_date_col     = 'intervention_date',   # your pre-period
+  n_matches       = 3
+)
+
 
 dplyr::glimpse(synthetic_panel)
 
@@ -216,6 +228,22 @@ synthetic_panel2<-synthetic_panel%>%
   mutate(intervention_date = min(date[post == 1]),
          end_date=max(date[post == 1]))%>%
   ungroup()
+
+# If all we want are the top 10 controls
+sales_data2<-sales_data%>%
+  mutate(intervention_date = min(date[post == 1]),
+         end_date=max(date[post == 1]))
+
+top10 <- best_matches_all_cities(
+  data = sales_data2,
+  matching_metric = "sales",
+  matches_per_city = 10,
+  intervention_date_col = "intervention_date",
+  pre_period_days = 90,       
+  per_city_window = FALSE,    
+  dtw_emphasis = 0.5
+)
+
 
 # Run CausalImpact by group, absolutely do not open the result dataframe
 ci_nested <- synthetic_panel %>%

@@ -313,8 +313,14 @@ build_synthetic_control <- function(data,
                                     date_col        = "date",
                                     city_col        = "city",
                                     treat_col       = "treat",
-                                    match_window    = c("2024-06-01", "2024-09-15"),
-                                    n_matches       = 3) {
+                                    n_matches       = 3,
+                                    match_window    = NULL,
+                                    intervention_date_col = NULL,
+                                    pre_period_days = NULL,
+                                    per_city_window = FALSE,
+                                    warping_limit   = 2,
+                                    dtw_emphasis    = 0.5,
+                                    parallel        = FALSE) {
   suppressWarnings({
     library(MarketMatching)
     library(dplyr)
@@ -322,20 +328,17 @@ build_synthetic_control <- function(data,
     library(purrr)
     library(tibble)
     
-    # dynamic output column names
     treat_name <- paste0("treatment_", matching_metric)
     synth_name <- paste0("synthetic_", matching_metric)
     
     eps <- 1e-9
     
-    # 0) Ensure types: date as Date, city as character ----------------------
     data <- data %>%
       mutate(
         !!date_col := ymd(.data[[date_col]]),
         !!city_col := as.character(.data[[city_col]])
       )
     
-    # 1) Identify treated + control cities ----------------------------------
     treated_cities <- data %>%
       filter(.data[[treat_col]] == 1) %>%
       pull(.data[[city_col]]) %>%
@@ -350,88 +353,169 @@ build_synthetic_control <- function(data,
       stop("Need at least one treated and one control city.")
     }
     
-    # 2) Data for best_matches ----------------------------------------------
     matching_data <- data %>%
-      select(
-        !!city_col,
-        !!date_col,
-        !!matching_metric
+      select(!!city_col, !!date_col, !!matching_metric)
+    
+    compute_start_end <- function(df, end_date) {
+      end_date <- as.Date(end_date)
+      start_date <- min(df[[date_col]], na.rm = TRUE)
+      if (!is.null(pre_period_days)) {
+        start_date <- max(start_date, end_date - as.integer(pre_period_days) + 1)
+      }
+      list(start = start_date, end = end_date)
+    }
+    
+    use_match_window <- !is.null(match_window) && length(match_window) == 2
+    use_intervention <- !is.null(intervention_date_col)
+    
+    if (!use_match_window && !use_intervention) {
+      stop("Provide either match_window (length 2) OR intervention_date_col.")
+    }
+    
+    # helper to compute match mapping from a best_matches result table
+    build_mapping <- function(best_tab) {
+      best_tab %>%
+        mutate(
+          treated_city = as.character(treated_city),
+          BestControl  = as.character(BestControl)
+        ) %>%
+        filter(
+          treated_city %in% treated_cities,
+          BestControl  %in% control_cities
+        ) %>%
+        group_by(treated_city) %>%
+        arrange(RelativeDistance, .by_group = TRUE) %>%
+        slice_head(n = n_matches) %>%
+        ungroup() %>%
+        rename(control_city = BestControl) %>%
+        group_by(treated_city) %>%
+        mutate(
+          raw_w  = 1 / (RelativeDistance + eps),
+          weight = raw_w / sum(raw_w)
+        ) %>%
+        ungroup() %>%
+        select(treated_city, control_city, RelativeDistance, weight)
+    }
+    
+    # -------------------------
+    # Build match_mapping
+    # -------------------------
+    if (!per_city_window) {
+      
+      if (use_match_window) {
+        start_match_period <- as.Date(match_window[1])
+        end_match_period   <- as.Date(match_window[2])
+      } else {
+        # shared end date uses earliest intervention among treated cities
+        end_dates <- data %>%
+          filter(.data[[city_col]] %in% treated_cities) %>%
+          pull(.data[[intervention_date_col]]) %>%
+          unique()
+        
+        end_dates <- ymd(end_dates)
+        end_match_period <- min(end_dates, na.rm = TRUE) - 1
+        
+        se <- compute_start_end(data, end_match_period)
+        start_match_period <- se$start
+        end_match_period   <- se$end
+      }
+      
+      mm <- best_matches(
+        data                  = matching_data,
+        markets_to_be_matched = treated_cities,
+        id_variable           = city_col,
+        date_variable         = date_col,
+        matching_variable     = matching_metric,
+        parallel              = parallel,
+        warping_limit         = warping_limit,
+        dtw_emphasis          = dtw_emphasis,
+        start_match_period    = start_match_period,
+        end_match_period      = end_match_period,
+        matches               = 10
       )
-    
-    # 3) Run best_matches ---------------------------------------------------
-    mm <- best_matches(
-      data                  = matching_data,
-      markets_to_be_matched = treated_cities,
-      id_variable           = city_col,
-      date_variable         = date_col,
-      matching_variable     = matching_metric,
-      parallel              = FALSE,
-      warping_limit         = 2,
-      dtw_emphasis          = 0.5,
-      start_match_period    = as.Date(match_window[1]),
-      end_match_period      = as.Date(match_window[2]),
-      matches               = 10
-    )
-    
-    best_tab <- as_tibble(mm$BestMatches)
-    
-    # treated id column has same name as city_col; rename to treated_city
-    id_col_name <- mm$MarketID
-    names(best_tab)[names(best_tab) == id_col_name] <- "treated_city"
-    
-    # 4) Build treated → control mapping, keep top n + compute weights -------
-    match_mapping <- best_tab %>%
-      mutate(
-        treated_city = as.character(treated_city),
-        BestControl  = as.character(BestControl)
-      ) %>%
-      filter(
-        treated_city %in% treated_cities,
-        BestControl  %in% control_cities
-      ) %>%
-      group_by(treated_city) %>%
-      arrange(RelativeDistance, .by_group = TRUE) %>%
-      slice_head(n = n_matches) %>%
-      ungroup() %>%
-      rename(control_city = BestControl) %>%
-      group_by(treated_city) %>%
-      mutate(
-        raw_w  = 1 / (RelativeDistance + eps),
-        weight = raw_w / sum(raw_w)
-      ) %>%
-      ungroup() %>%
-      select(treated_city, control_city, RelativeDistance, weight)
+      
+      best_tab <- as_tibble(mm$BestMatches)
+      id_col_name <- mm$MarketID
+      names(best_tab)[names(best_tab) == id_col_name] <- "treated_city"
+      
+      match_mapping <- build_mapping(best_tab)
+      
+    } else {
+      
+      if (!use_intervention) {
+        stop("per_city_window = TRUE requires intervention_date_col.")
+      }
+      
+      # lookup intervention date per treated city
+      city_iv <- data %>%
+        filter(.data[[city_col]] %in% treated_cities) %>%
+        select(!!city_col, !!intervention_date_col) %>%
+        distinct() %>%
+        mutate(intervention_date = ymd(.data[[intervention_date_col]])) %>%
+        select(treated_city = !!city_col, intervention_date)
+      
+      match_mapping <- map_dfr(treated_cities, function(cty) {
+        end_date <- city_iv %>%
+          filter(treated_city == cty) %>%
+          pull(intervention_date)
+        
+        if (length(end_date) == 0 || is.na(end_date[1])) return(tibble())
+        
+        end_match_period <- as.Date(end_date[1]) - 1
+        se <- compute_start_end(data, end_match_period)
+        
+        mm <- best_matches(
+          data                  = matching_data,
+          markets_to_be_matched = cty,
+          id_variable           = city_col,
+          date_variable         = date_col,
+          matching_variable     = matching_metric,
+          parallel              = parallel,
+          warping_limit         = warping_limit,
+          dtw_emphasis          = dtw_emphasis,
+          start_match_period    = se$start,
+          end_match_period      = se$end,
+          matches               = 10
+        )
+        
+        best_tab <- as_tibble(mm$BestMatches)
+        id_col_name <- mm$MarketID
+        names(best_tab)[names(best_tab) == id_col_name] <- "treated_city"
+        
+        build_mapping(best_tab) %>%
+          filter(treated_city == cty)
+      })
+    }
     
     if (nrow(match_mapping) == 0) {
       message("No valid treated→control matches after filtering to control cities.")
       return(tibble())
     }
     
-    # 5) Build the panel: one row per date × treated_city with treat + synth -
+    # -------------------------
+    # Build synthetic panel
+    # -------------------------
     synth_panel <- map_dfr(unique(match_mapping$treated_city), function(cty) {
       
-      # weights for this treated city (keep in weight order)
       w_tbl <- match_mapping %>%
         filter(treated_city == cty) %>%
-        arrange(weight, .by_group = FALSE, desc = TRUE) %>%  # optional: sort by weight desc
+        arrange(desc(weight)) %>%
         transmute(control_city, weight)
       
       donor_cities  <- w_tbl$control_city
       donor_weights <- w_tbl$weight
       donor_weights_named <- setNames(donor_weights, donor_cities)
       
-      # treated series
       df_treat <- data %>%
         filter(.data[[city_col]] == cty) %>%
         group_by(.data[[date_col]]) %>%
         summarise(
           !!treat_name := sum(.data[[matching_metric]], na.rm = TRUE),
-          post         = max(.data[["post"]]),   # assumes 0/1 per date
+          post         = max(.data[["post"]]),
           .groups      = "drop"
         ) %>%
         rename(date = !!date_col)
       
-      # synthetic series: weighted mean across matched controls
       df_ctrl <- data %>%
         filter(.data[[treat_col]] == 0) %>%
         mutate(control_city = as.character(.data[[city_col]])) %>%
@@ -456,6 +540,202 @@ build_synthetic_control <- function(data,
     synth_panel
   })
 }
+
+
+# Return Top N matches per city, no weighting, no synthetic control
+best_matches_all_cities <- function(data,
+                                    matching_metric      = "sales",
+                                    date_col             = "date",
+                                    city_col             = "city",
+                                    treat_col            = "treat",
+                                    matches_per_city     = 10,
+                                    donors_controls_only = TRUE,
+                                    compute_weights      = FALSE,
+                                    warping_limit        = 2,
+                                    dtw_emphasis         = 0.5,
+                                    parallel             = FALSE,
+                                    intervention_date_col = NULL,
+                                    pre_period_days      = NULL,
+                                    per_city_window      = FALSE,
+                                    match_window         = NULL) {
+  suppressWarnings({
+    library(MarketMatching)
+    library(dplyr)
+    library(lubridate)
+    library(tibble)
+    library(purrr)
+    
+    eps <- 1e-9
+    
+    data <- data %>%
+      mutate(
+        !!date_col := ymd(.data[[date_col]]),
+        !!city_col := as.character(.data[[city_col]])
+      )
+    
+    all_cities <- data %>% pull(.data[[city_col]]) %>% unique()
+    if (length(all_cities) < 2) stop("Need at least 2 cities to compute matches.")
+    
+    control_cities <- data %>%
+      filter(.data[[treat_col]] == 0) %>%
+      pull(.data[[city_col]]) %>%
+      unique()
+    
+    matching_data <- data %>% select(!!city_col, !!date_col, !!matching_metric)
+    
+    # Helper: compute match start/end given a df and a chosen end date
+    compute_start_end <- function(df, end_date) {
+      end_date <- as.Date(end_date)
+      start_date <- min(df[[date_col]], na.rm = TRUE)
+      if (!is.null(pre_period_days)) {
+        start_date <- max(start_date, end_date - as.integer(pre_period_days) + 1)
+      }
+      list(start = start_date, end = end_date)
+    }
+    
+    # Decide matching windows
+    use_match_window <- !is.null(match_window) && length(match_window) == 2
+    use_intervention <- !is.null(intervention_date_col)
+    
+    if (!use_match_window && !use_intervention) {
+      stop("Provide either match_window (length 2) OR intervention_date_col.")
+    }
+    
+    # Approach A: one shared window for all cities
+    if (!per_city_window) {
+      
+      if (use_match_window) {
+        start_match_period <- as.Date(match_window[1])
+        end_match_period <- as.Date(match_window[2])
+      } else {
+        # Shared end date = earliest intervention date among treated cities
+        treated_cities <- data %>%
+          filter(.data[[treat_col]] == 1) %>%
+          pull(.data[[city_col]]) %>%
+          unique()
+        
+        if (length(treated_cities) == 0) stop("No treated cities found for intervention-based matching.")
+        
+        end_date <- data %>%
+          filter(.data[[city_col]] %in% treated_cities) %>%
+          pull(.data[[intervention_date_col]]) %>%
+          unique()
+        
+        end_date <- ymd(end_date)
+        end_date <- min(end_date, na.rm = TRUE) - 1  # end of pre period
+        
+        se <- compute_start_end(data, end_date)
+        start_match_period <- se$start
+        end_match_period <- se$end
+      }
+      
+      mm <- best_matches(
+        data                  = matching_data,
+        markets_to_be_matched = all_cities,
+        id_variable           = city_col,
+        date_variable         = date_col,
+        matching_variable     = matching_metric,
+        parallel              = parallel,
+        warping_limit         = warping_limit,
+        dtw_emphasis          = dtw_emphasis,
+        start_match_period    = start_match_period,
+        end_match_period      = end_match_period,
+        matches               = matches_per_city
+      )
+      
+      best_tab <- as_tibble(mm$BestMatches)
+      id_col_name <- mm$MarketID
+      names(best_tab)[names(best_tab) == id_col_name] <- "city"
+      
+      out <- best_tab %>%
+        mutate(city = as.character(city), BestControl = as.character(BestControl)) %>%
+        filter(city != BestControl)
+      
+      if (donors_controls_only) out <- out %>% filter(BestControl %in% control_cities)
+      
+      out <- out %>%
+        group_by(city) %>%
+        arrange(RelativeDistance, .by_group = TRUE) %>%
+        slice_head(n = matches_per_city) %>%
+        mutate(rank = row_number()) %>%
+        ungroup() %>%
+        rename(match_city = BestControl)
+      
+      if (compute_weights) {
+        out <- out %>%
+          group_by(city) %>%
+          mutate(raw_w = 1 / (RelativeDistance + eps), weight = raw_w / sum(raw_w)) %>%
+          ungroup()
+      }
+      
+      return(out %>% select(city, match_city, RelativeDistance, rank, any_of("weight")))
+    }
+    
+    # Approach B: per-city window (most correct)
+    # We run best_matches one city at a time so each city uses its own pre period end date
+    if (use_match_window) {
+      stop("per_city_window=TRUE is intended for intervention_date_col based matching. Use per_city_window=FALSE for match_window.")
+    }
+    
+    # Build a lookup of intervention dates per city
+    city_interventions <- data %>%
+      select(!!city_col, !!intervention_date_col) %>%
+      distinct() %>%
+      mutate(
+        intervention_date = ymd(.data[[intervention_date_col]])
+      ) %>%
+      select(city = !!city_col, intervention_date)
+    
+    out <- map_dfr(all_cities, function(cty) {
+      end_date <- city_interventions %>%
+        filter(city == cty) %>%
+        pull(intervention_date)
+      
+      if (length(end_date) == 0 || is.na(end_date[1])) {
+        return(tibble())  # skip if no intervention date for this city
+      }
+      
+      end_date <- as.Date(end_date[1]) - 1
+      se <- compute_start_end(data, end_date)
+      
+      mm <- best_matches(
+        data                  = matching_data,
+        markets_to_be_matched = cty,
+        id_variable           = city_col,
+        date_variable         = date_col,
+        matching_variable     = matching_metric,
+        parallel              = parallel,
+        warping_limit         = warping_limit,
+        dtw_emphasis          = dtw_emphasis,
+        start_match_period    = se$start,
+        end_match_period      = se$end,
+        matches               = matches_per_city
+      )
+      
+      best_tab <- as_tibble(mm$BestMatches)
+      id_col_name <- mm$MarketID
+      names(best_tab)[names(best_tab) == id_col_name] <- "city"
+      
+      best_tab %>%
+        mutate(city = as.character(city), BestControl = as.character(BestControl)) %>%
+        filter(city == cty, city != BestControl) %>%
+        { if (donors_controls_only) dplyr::filter(., BestControl %in% control_cities) else . } %>%
+        arrange(RelativeDistance) %>%
+        slice_head(n = matches_per_city) %>%
+        mutate(rank = row_number()) %>%
+        rename(match_city = BestControl) %>%
+        { if (compute_weights)
+          dplyr::mutate(., raw_w = 1 / (RelativeDistance + eps)) %>%
+            dplyr::mutate(weight = raw_w / sum(raw_w))
+          else .
+        } %>%
+        select(city, match_city, RelativeDistance, rank, any_of("weight"))
+    })
+    
+    out
+  })
+}
+
 
 
 # Build Synthetic Control using Ridge Regression
