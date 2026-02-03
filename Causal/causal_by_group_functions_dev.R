@@ -183,6 +183,23 @@ save_causal_impact_ggplots <- function(df, output_file = "causal_impact_plots.pd
   library(ggplot2)
   library(patchwork)
   
+  theme_causal<- function() {
+    ggthemes::theme_fivethirtyeight() %+replace% 
+      theme(
+        plot.title = element_text(hjust=0.5, size=22,face="bold", color='#ebba34'),
+        plot.subtitle = element_text(hjust=0.5, size=12, face="italic"),
+        legend.position = "bottom",
+        legend.text=element_text(size=16, face="bold"),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1,size=12,face="bold"),
+        axis.text.y = element_text(size=10,face="bold"),
+        axis.title = element_text(size=11,face="bold"), 
+        axis.title.x = element_blank(),
+        plot.background=element_rect(fill="white"),
+        panel.background=element_rect(fill="white"),
+        legend.background=element_rect(fill="white")
+      )
+  }
+  
   pdf(output_file, width = 12, height = 10)
   
   for (i in seq_len(nrow(df))) {
@@ -222,6 +239,73 @@ save_causal_impact_ggplots <- function(df, output_file = "causal_impact_plots.pd
   dev.off()
 }
 
+# Plots to the RStudio viewer using ggplot
+plot_causal_impact_ggplots <- function(df, pause = TRUE) {
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  
+  theme_causal<- function() {
+    ggthemes::theme_fivethirtyeight() %+replace% 
+      theme(
+        plot.title = element_text(hjust=0.5, size=22,face="bold", color='#ebba34'),
+        plot.subtitle = element_text(hjust=0.5, size=12, face="italic"),
+        legend.position = "bottom",
+        legend.text=element_text(size=16, face="bold"),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1,size=12,face="bold"),
+        axis.text.y = element_text(size=10,face="bold"),
+        axis.title = element_text(size=11,face="bold"), 
+        axis.title.x = element_blank(),
+        plot.background=element_rect(fill="white"),
+        panel.background=element_rect(fill="white"),
+        legend.background=element_rect(fill="white")
+      )
+  }
+  
+  for (i in seq_len(nrow(df))) {
+    group_label <- df$group[i]
+    ci_obj <- df$causal_impact[[i]]
+    
+    if (!is.null(ci_obj) && !is.null(ci_obj$model$series)) {
+      
+      df_plot <- as.data.frame(ci_obj$model$series) %>%
+        rownames_to_column("date") %>%
+        mutate(date = as.Date(date))
+      
+      p1 <- ggplot(df_plot, aes(x = date)) +
+        geom_line(aes(y = response)) +
+        geom_line(aes(y = point.pred), linetype = "dashed", color = "blue") +
+        geom_ribbon(aes(ymin = point.pred.lower, ymax = point.pred.upper), alpha = 0.2) +
+        labs(title = "Observed vs. Predicted") +
+        theme_causal()
+      
+      p2 <- ggplot(df_plot, aes(x = date)) +
+        geom_line(aes(y = point.effect), color = "darkgreen") +
+        geom_ribbon(aes(ymin = point.effect.lower, ymax = point.effect.upper), alpha = 0.2) +
+        labs(title = "Pointwise Causal Effect") +
+        theme_causal()
+      
+      p3 <- ggplot(df_plot, aes(x = date)) +
+        geom_line(aes(y = cum.effect), color = "darkred") +
+        geom_ribbon(aes(ymin = cum.effect.lower, ymax = cum.effect.upper), alpha = 0.2) +
+        labs(title = "Cumulative Effect") +
+        theme_causal()
+      
+      full_plot <- (p1 / p2 / p3) +
+        patchwork::plot_annotation(title = group_label)
+      
+      print(full_plot)
+      
+      if (pause && i < nrow(df)) {
+        message("Press <Enter> to view next plot...")
+        invisible(readline())
+      }
+    }
+  }
+}
+
+
 # This function replaces manually looping through each data frame after matching. It finds the best control group
 # for each test group, maps each group to the identified control group, and then loops through each group and calculates control metric.
 build_synthetic_control <- function(data,
@@ -237,7 +321,12 @@ build_synthetic_control <- function(data,
     library(lubridate)
     library(purrr)
     library(tibble)
-    library(glue)
+    
+    # dynamic output column names
+    treat_name <- paste0("treatment_", matching_metric)
+    synth_name <- paste0("synthetic_", matching_metric)
+    
+    eps <- 1e-9
     
     # 0) Ensure types: date as Date, city as character ----------------------
     data <- data %>%
@@ -246,13 +335,12 @@ build_synthetic_control <- function(data,
         !!city_col := as.character(.data[[city_col]])
       )
     
-    # 1) Identify treated cities (we want synthetic controls for these) -----
+    # 1) Identify treated + control cities ----------------------------------
     treated_cities <- data %>%
       filter(.data[[treat_col]] == 1) %>%
       pull(.data[[city_col]]) %>%
       unique()
     
-    # candidates for donors (controls)
     control_cities <- data %>%
       filter(.data[[treat_col]] == 0) %>%
       pull(.data[[city_col]]) %>%
@@ -262,7 +350,7 @@ build_synthetic_control <- function(data,
       stop("Need at least one treated and one control city.")
     }
     
-    # 2) Data for best_matches: all cities, but only the needed columns -----
+    # 2) Data for best_matches ----------------------------------------------
     matching_data <- data %>%
       select(
         !!city_col,
@@ -270,7 +358,7 @@ build_synthetic_control <- function(data,
         !!matching_metric
       )
     
-    # 3) Run best_matches for all treated cities at once --------------------
+    # 3) Run best_matches ---------------------------------------------------
     mm <- best_matches(
       data                  = matching_data,
       markets_to_be_matched = treated_cities,
@@ -282,17 +370,16 @@ build_synthetic_control <- function(data,
       dtw_emphasis          = 0.5,
       start_match_period    = as.Date(match_window[1]),
       end_match_period      = as.Date(match_window[2]),
-      matches               = 10        # ask for plenty, we'll trim to n_matches
+      matches               = 10
     )
     
     best_tab <- as_tibble(mm$BestMatches)
     
-    # The column with treated IDs has the same name as city_col (e.g. "city")
+    # treated id column has same name as city_col; rename to treated_city
     id_col_name <- mm$MarketID
-    
     names(best_tab)[names(best_tab) == id_col_name] <- "treated_city"
     
-    # 4) Build treated → control mapping, enforcing donors are controls -----
+    # 4) Build treated → control mapping, keep top n + compute weights -------
     match_mapping <- best_tab %>%
       mutate(
         treated_city = as.character(treated_city),
@@ -303,54 +390,73 @@ build_synthetic_control <- function(data,
         BestControl  %in% control_cities
       ) %>%
       group_by(treated_city) %>%
-      # choose top n_matches by whatever ranking column is there
-      # Often there is a 'RelativeDistance' or 'Correlation' column.
       arrange(RelativeDistance, .by_group = TRUE) %>%
       slice_head(n = n_matches) %>%
       ungroup() %>%
-      rename(control_city = BestControl)
+      rename(control_city = BestControl) %>%
+      group_by(treated_city) %>%
+      mutate(
+        raw_w  = 1 / (RelativeDistance + eps),
+        weight = raw_w / sum(raw_w)
+      ) %>%
+      ungroup() %>%
+      select(treated_city, control_city, RelativeDistance, weight)
     
     if (nrow(match_mapping) == 0) {
       message("No valid treated→control matches after filtering to control cities.")
       return(tibble())
     }
     
-    # 5) Build the panel: one row per date × treated_city with treat + synth totals
+    # 5) Build the panel: one row per date × treated_city with treat + synth -
     synth_panel <- map_dfr(unique(match_mapping$treated_city), function(cty) {
-      matched_controls <- match_mapping %>%
+      
+      # weights for this treated city (keep in weight order)
+      w_tbl <- match_mapping %>%
         filter(treated_city == cty) %>%
-        pull(control_city)
+        arrange(weight, .by_group = FALSE, desc = TRUE) %>%  # optional: sort by weight desc
+        transmute(control_city, weight)
+      
+      donor_cities  <- w_tbl$control_city
+      donor_weights <- w_tbl$weight
+      donor_weights_named <- setNames(donor_weights, donor_cities)
       
       # treated series
       df_treat <- data %>%
         filter(.data[[city_col]] == cty) %>%
         group_by(.data[[date_col]]) %>%
         summarise(
-          treat_sales = sum(.data[[matching_metric]], na.rm = TRUE),
-          post        = max(.data[["post"]]),   # assuming 0/1 per date
-          .groups     = "drop"
+          !!treat_name := sum(.data[[matching_metric]], na.rm = TRUE),
+          post         = max(.data[["post"]]),   # assumes 0/1 per date
+          .groups      = "drop"
         ) %>%
         rename(date = !!date_col)
       
-      # synthetic control = sum across matched control cities (treat == 0)
+      # synthetic series: weighted mean across matched controls
       df_ctrl <- data %>%
-        filter(.data[[city_col]] %in% matched_controls,
-               .data[[treat_col]] == 0) %>%
+        filter(.data[[treat_col]] == 0) %>%
+        mutate(control_city = as.character(.data[[city_col]])) %>%
+        inner_join(w_tbl, by = "control_city") %>%
         group_by(.data[[date_col]]) %>%
         summarise(
-          synth_sales = median(.data[[matching_metric]], na.rm = TRUE),
-          .groups     = "drop"
+          !!synth_name := weighted.mean(.data[[matching_metric]], w = weight, na.rm = TRUE),
+          .groups      = "drop"
         ) %>%
         rename(date = !!date_col)
       
       df_treat %>%
         left_join(df_ctrl, by = "date") %>%
-        mutate(treated_city = cty)
+        mutate(
+          treated_city = cty,
+          synthetic_cities        = list(donor_cities),
+          synthetic_weights       = list(donor_weights),
+          synthetic_weights_named = list(donor_weights_named)
+        )
     })
     
     synth_panel
   })
 }
+
 
 # Build Synthetic Control using Ridge Regression
 build_synth_controls_ridge <- function(data,
@@ -604,4 +710,228 @@ build_synth_controls_tidysynth <- function(data, ...) {
   
   bind_rows(compact(synth_list)) %>%
     arrange(city, date)
+}
+
+# Uses DiD to run incrementality tests by city
+incrementality_by_city <- function(df_city, treat_col, synth_col) {
+  df_city <- df_city %>%
+    arrange(date) %>%
+    mutate(
+      gap = .data[[treat_col]] - .data[[synth_col]]
+    ) %>%
+    filter(!is.na(gap), !is.na(post))
+  
+  pre  <- df_city %>% filter(post == 0)
+  post <- df_city %>% filter(post == 1)
+  
+  # Guardrails
+  if (nrow(pre) < 2 || nrow(post) < 2) {
+    return(tibble(
+      n_pre = nrow(pre), n_post = nrow(post),
+      pre_mean_gap = NA_real_, post_mean_gap = NA_real_,
+      did = NA_real_, did_p = NA_real_,
+      post_mean = NA_real_, post_p = NA_real_
+    ))
+  }
+  
+  # 1) DID on time series gaps: (mean post gap) - (mean pre gap)
+  did <- mean(post$gap) - mean(pre$gap)
+  
+  # Simple OLS on gap ~ post (robust SE would be nicer, but keeping deps minimal)
+  fit <- tryCatch(stats::lm(gap ~ post, data = df_city), error = function(e) NULL)
+  did_p <- if (!is.null(fit)) summary(fit)$coefficients["post", "Pr(>|t|)"] else NA_real_
+  
+  # 2) Paired t-test on post gaps vs 0 (are post gaps positive?)
+  tt <- tryCatch(stats::t.test(post$gap, mu = 0), error = function(e) NULL)
+  
+  tibble(
+    n_pre = nrow(pre),
+    n_post = nrow(post),
+    pre_mean_gap = mean(pre$gap),
+    post_mean_gap = mean(post$gap),
+    did = did,
+    did_p = did_p,
+    post_mean = if (!is.null(tt)) unname(tt$estimate) else NA_real_,
+    post_p = if (!is.null(tt)) tt$p.value else NA_real_,
+    post_ci_low = if (!is.null(tt)) tt$conf.int[1] else NA_real_,
+    post_ci_high = if (!is.null(tt)) tt$conf.int[2] else NA_real_
+  )
+}
+
+# Placebo Test Single City
+placebo_test_one_city <- function(df_city,
+                                  treat_col,
+                                  synth_col,
+                                  post_col = "post",
+                                  n_placebos = 500,
+                                  seed = 1,
+                                  one_sided = TRUE,
+                                  keep_dist = FALSE) {
+  set.seed(seed)
+  
+  df_city <- df_city %>%
+    dplyr::arrange(date) %>%
+    dplyr::mutate(gap = .data[[treat_col]] - .data[[synth_col]]) %>%
+    dplyr::filter(!is.na(date), !is.na(gap), !is.na(.data[[post_col]]))
+  
+  post_idx <- which(df_city[[post_col]] == 1)
+  n_post <- length(post_idx)
+  
+  if (n_post < 5 || nrow(df_city) < (n_post + 10)) {
+    return(tibble::tibble(
+      n_post = n_post,
+      observed_cum_lift = NA_real_,
+      observed_avg_lift = NA_real_,
+      placebo_p = NA_real_
+    ))
+  }
+  
+  observed <- sum(df_city$gap[post_idx], na.rm = TRUE)
+  observed_avg <- mean(df_city$gap[post_idx], na.rm = TRUE)
+  
+  n <- nrow(df_city)
+  max_start <- n - n_post + 1
+  starts <- sample.int(max_start, size = n_placebos, replace = TRUE)
+  
+  placebo_lifts <- vapply(
+    starts,
+    function(s) sum(df_city$gap[s:(s + n_post - 1)], na.rm = TRUE),
+    numeric(1)
+  )
+  
+  placebo_p <- if (one_sided) {
+    mean(placebo_lifts >= observed)
+  } else {
+    mean(abs(placebo_lifts) >= abs(observed))
+  }
+  
+  tibble::tibble(
+    n_post = n_post,
+    observed_cum_lift = observed,
+    observed_avg_lift = observed_avg,
+    
+    placebo_p = placebo_p,
+    z_score = (observed - mean(placebo_lifts)) / sd(placebo_lifts),
+    snr = observed / sd(placebo_lifts),
+    
+    ci_90_low = quantile(placebo_lifts, 0.05),
+    ci_90_high = quantile(placebo_lifts, 0.95),
+    ci_95_low = quantile(placebo_lifts, 0.025),
+    ci_95_high = quantile(placebo_lifts, 0.975),
+    
+    rank_percentile = mean(placebo_lifts < observed),
+    sign_stability = mean(sign(placebo_lifts) == sign(observed)),
+    
+    placebo_lifts = if (keep_dist) list(placebo_lifts) else NULL
+  )
+}
+
+# Placebo test, multiple cities. Requires single city version to be run first.
+
+run_placebo_tests_by_city <- function(df,
+                                      group_col = "treated_city",
+                                      treat_col,
+                                      synth_col,
+                                      post_col = "post",
+                                      n_placebos = 500,
+                                      seed = 1,
+                                      one_sided = TRUE,
+                                      keep_dist = FALSE) {
+  
+  df %>%
+    dplyr::group_by(.data[[group_col]]) %>%
+    dplyr::group_modify(~{
+      placebo_test_one_city(
+        df_city = .x,
+        treat_col = treat_col,
+        synth_col = synth_col,
+        post_col = post_col,
+        n_placebos = n_placebos,
+        seed = seed,
+        one_sided = one_sided,
+        keep_dist = keep_dist
+      )
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::rename(!!group_col := .data[[group_col]])
+}
+
+# MDE/Power test single city
+# Estimates how big an incremental effect you could reliably detect for a single treated city, given historical noise and post-period length
+mde_one_city <- function(df_city,
+                         treat_col,
+                         synth_col,
+                         post_col = "post",
+                         alpha = 0.05,
+                         target_power = 0.80,
+                         two_sided = TRUE) {
+  
+  df_city <- df_city %>%
+    dplyr::arrange(date) %>%
+    dplyr::mutate(gap = .data[[treat_col]] - .data[[synth_col]]) %>%
+    dplyr::filter(!is.na(date), !is.na(gap), !is.na(.data[[post_col]]))
+  
+  pre  <- df_city %>% dplyr::filter(.data[[post_col]] == 0)
+  post <- df_city %>% dplyr::filter(.data[[post_col]] == 1)
+  
+  n_pre  <- nrow(pre)
+  n_post <- nrow(post)
+  pre_sd <- stats::sd(pre$gap)
+  
+  if (is.na(pre_sd) || n_post <= 1) {
+    return(tibble::tibble(
+      n_pre = n_pre,
+      n_post = n_post,
+      pre_sd_gap = pre_sd,
+      mde_avg = NA_real_,
+      mde_cum = NA_real_,
+      alpha = alpha,
+      target_power = target_power,
+      two_sided = two_sided
+    ))
+  }
+  
+  z_alpha <- if (two_sided) stats::qnorm(1 - alpha / 2) else stats::qnorm(1 - alpha)
+  z_beta  <- stats::qnorm(target_power)
+  
+  mde_avg <- (z_alpha + z_beta) * pre_sd / sqrt(n_post)
+  mde_cum <- mde_avg * n_post
+  
+  tibble::tibble(
+    n_pre = n_pre,
+    n_post = n_post,
+    pre_sd_gap = pre_sd,
+    mde_avg = mde_avg,
+    mde_cum = mde_cum,
+    alpha = alpha,
+    target_power = target_power,
+    two_sided = two_sided
+  )
+}
+
+# MDE by group
+run_mde_by_city <- function(df,
+                            group_col = "treated_city",
+                            treat_col,
+                            synth_col,
+                            post_col = "post",
+                            alpha = 0.05,
+                            target_power = 0.80,
+                            two_sided = TRUE) {
+  
+  df %>%
+    dplyr::group_by(.data[[group_col]]) %>%
+    dplyr::group_modify(~{
+      mde_one_city(
+        df_city = .x,
+        treat_col = treat_col,
+        synth_col = synth_col,
+        post_col = post_col,
+        alpha = alpha,
+        target_power = target_power,
+        two_sided = two_sided
+      )
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::rename(!!group_col := .data[[group_col]])
 }
