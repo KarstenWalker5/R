@@ -1,6 +1,6 @@
 ---
 title: "Parallel Trends Pre-Checks"
-output: html_document
+output: github_document
 date: "2026-02-05"
 ---
 
