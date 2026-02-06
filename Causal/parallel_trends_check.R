@@ -31,10 +31,10 @@ theme_fancy <- function() {
 }
 
 # Load causal pre-check function
-source("/Users/karstenwalker/Documents/R/Causal/causal_pre_check.R")
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_pre_check.R")
 
 # Load optional group by functions
-source("/Users/karstenwalker/Documents/R/Causal/causal_by_group_functions_dev.R")
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_by_group_functions_dev.R")
 
 ## Generate synthetic data for example
 # Params
@@ -217,7 +217,6 @@ sales_data %>%
   theme_fancy()
 
 # Distribution of spend
-
 ggplot(sales_data%>%
          filter(post==0), aes(x = as.factor(treat), y = sales, fill=factor(treat)))+
   geom_violin()+
@@ -237,12 +236,12 @@ fligner.test(sales ~ factor(treat), data = sales_data%>%
 
 ggplot(sales_data%>%
          filter(post==0), aes(x = factor(treat), y = sales, fill=factor(treat))) +
+  geom_violin()+
   geom_boxplot() +
   labs( title = "Pre-Period Sales Variance: Treated vs Control",
-        x = "Group (0 = Control, 1 = Treated)",
         y = "Sales") +
-  theme(legend.title=element_blank())+
-  theme_fancy()
+  theme_fancy()+
+  theme(legend.title=element_blank())
 
 # Using helper function
 diag_results <- pre_treatment_diagnostics(

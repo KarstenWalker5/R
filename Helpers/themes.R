@@ -19,15 +19,14 @@ theme_awesome <- function (base_family = "Avenir") {
 }
 
 theme_fancy <- function() {
-  theme_minimal() +
-    theme(panel.grid.minor = element_blank(),
+  ggthemes::theme_fivethirtyeight() %+replace% 
+    theme(panel.grid.major.x = element_blank(),
           panel.grid.major.y = element_blank(),
           plot.title = element_text(hjust=0.5, size=28,face="bold"),
           plot.subtitle = element_text(hjust=0.5, size=20, face="italic"),
           legend.position = "bottom",
           plot.background=element_rect(fill="white"),
           panel.background=element_rect(fill="white"),
-          legend.background=element_rect(fill="white"),
-          panel.border = element_blank()
+          legend.background=element_rect(fill="white")
           )
 }

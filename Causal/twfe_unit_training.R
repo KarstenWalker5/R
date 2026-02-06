@@ -37,10 +37,10 @@ theme_fancy <- function() {
 }
 
 # Load causal pre-check function
-source("/Users/karstenwalker/Documents/R/Causal/causal_pre_check.R")
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_pre_check.R")
 
 # Load optional group by functions
-source("/Users/karstenwalker/Documents/R/Causal/causal_by_group_functions_dev.R")
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_by_group_functions_dev.R")
 
 ## Generate synthetic data for example
 # Params

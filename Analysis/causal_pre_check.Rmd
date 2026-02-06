@@ -1,0 +1,592 @@
+---
+title: "Parallel Trends Pre-Checks"
+output: html_document
+date: "2026-02-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(fig.width=15, fig.height=10) 
+```
+
+In this script we walk through boilerplate causal pre-checks to determine if our data meets the parallel trends assumption in the pre period. We only look at the most essential functions as there are many more esoteric checks contained in our helper script documented below that are likely not always necessary. Please see the appendix for a list of functions and their use.
+
+###### Steps ######
+1. Basic visual inspection of pre/post campaign to examine parallel trends assumption.
+2. Analysis of variance in pre/post sales data.
+3. Optional: Event study comparison to determine the difference between between pre/post, which helps us determine if the difference is a function of surrounding time periods OR the intervention.
+4. We use linear regression to compare pre-intervention trends between groups.
+
+```{r load_packages, warnings=FALSE, message=FALSE}
+
+# Load required packages
+packages <- c(
+  "dplyr",
+  "tidyr",
+  "tidyverse",
+  "patchwork",
+  "broom",
+  "CausalImpact",
+  "scales",
+  "lubridate",
+  "lmtest",
+  "sandwich",
+  "fixest",
+  "car",
+  "feasts",
+  "infer",
+  "corrr",
+  "kableExtra"
+)
+
+installed <- rownames(installed.packages())
+to_install <- setdiff(packages, installed)
+
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+suppressPackageStartupMessages(
+  lapply(packages, library, character.only = TRUE)
+)
+
+# Set seed for synthetic data gen and model fitting
+set.seed(7)
+
+# Load theme
+source("/Users/karstenwalker/Documents/GitHub/R/Helpers/themes.R")
+
+# Load causal pre-check function
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_pre_check.R")
+
+# Load optional group by functions
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_by_group_functions_dev.R")
+
+```
+
+For this example we are going to generate synthetic data that contains 10 cities: 5 have been treated and 5 have not. We design the data such that there are parallel pre-period trends and there is a significant increase in only the treated cities. There is also a spend column which differs across cities that we can add as a unit effect for a TWFE model.
+
+```{r synth_data}
+n_days = 200
+n_cities = 10
+start_date = as.Date("2024-01-01")
+intervention_date = start_date + 100
+
+treated_cities = paste0("City_", 1:5)
+control_cities = paste0("City_", 6:10)
+
+beta_spend = 2
+spend_jump = 8
+epsilon_sd = 3
+beta_treat_direct = 4            # deterministic immediate/direct lift
+beta_city_shock = 5              # idiosyncratic city×date lift (survives FE)
+
+sales_data =
+  expand_grid(
+    date = seq.Date(start_date, by = "day", length.out = n_days),
+    city = paste0("City_", 1:n_cities)
+  ) %>%
+  mutate(
+    city = factor(city),
+    treat = if_else(city %in% treated_cities, 1L, 0L),
+    post = if_else(date >= intervention_date, 1L, 0L),
+    day_index = as.integer(date - start_date),
+    city_effect = rnorm(n_cities, sd = 4)[as.integer(city)],
+    common_trend = 0.05 * day_index,
+    spend = rnorm(n(), mean = 20, sd = 2),
+    epsilon = rnorm(n(), sd = epsilon_sd)
+  ) %>%
+  group_by(post, treat) %>%
+  mutate(spend_grp_mean = mean(spend)) %>%
+  ungroup() %>%
+  group_by(post) %>%
+  mutate(spend_overall_pre = if_else(post == 0, mean(spend[post == 0]), NA_real_)) %>%
+  ungroup() %>%
+  mutate(
+    spend_balanced = if_else(post == 0,
+                             spend - (spend_grp_mean - spend_overall_pre),
+                             spend
+    ),
+    spend = spend_balanced + spend_jump * treat * post,
+    treat_city_shock = beta_city_shock * rnorm(n(), mean = 1, sd = 0.2) * treat * post,
+    sales =
+      50 +
+      city_effect +
+      common_trend +
+      beta_spend * spend +
+      beta_treat_direct * treat * post +
+      treat_city_shock +
+      epsilon,
+    rel_time = as.integer(date - intervention_date)
+  ) %>%
+  select(date, city, treat, post, rel_time, spend, sales)%>%
+  mutate(treat=as.factor(treat))
+```
+
+Let's check out our data real quick
+```{r data_check}
+report::report(sales_data%>%
+                 select(-date))
+
+kbl(sales_data %>%
+  group_by(treat, city) %>%
+  summarize(
+    mean_sales = mean(sales, na.rm = TRUE),
+    med_sales = median(sales, na.rm = TRUE),
+    min_sales= min(sales, na.rm = TRUE),
+    max_sales= max(sales, na.rm = TRUE),
+    sd_sales = sd(sales),
+    min_date = min(date),
+    max_date = max(date)
+  )%>%
+  arrange(city, treat))%>%
+  kable_minimal()
+
+```
+Looks good, no missingness and plenty of variation that we built in.
+
+Overall pre/post visual check
+```{r overall}
+sales_data %>%
+  mutate(group = if_else(treat == 1, "Treated", "Control")) %>%
+  group_by(date, group) %>%
+  summarize(avg_sales = mean(sales), .groups = "drop") %>%
+  ggplot(aes(x = date, y = avg_sales, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = intervention_date, linetype = "dashed") +
+  geom_smooth()+
+  labs(
+    title = "Parallel Trends Check: Treated vs Control",
+    x = "Date",
+    y = "Average Daily Sales",
+    color = "Group"
+  ) +
+  theme_fancy()
+
+```
+
+Now by city
+
+```{r city_level}
+sales_data %>%
+  mutate(group = if_else(treat == 1, "Treated", "Control")) %>%
+  ggplot(aes(x = date, y = sales, color = group)) +
+  geom_line()+
+  geom_vline(xintercept = intervention_date, linetype = "dashed") +
+  facet_wrap(~ city, ncol = 5) +
+  labs(
+    title = "City-Level Sales Paths by Treatment Group",
+    x = "Date",
+    y = "Daily Sales",
+    color = "Group"
+  ) +
+  theme_fancy()
+
+```
+
+Let's check the distribution of sales, which should be fairly similar with a slightly different mean.
+```{r spend_dist}
+ggplot(sales_data%>%
+         filter(post==0), aes(x = as.factor(treat), y = sales, fill=factor(treat)))+
+  geom_violin(draw_quantiles = c(0.5))+
+  labs(title="Sales Distribution",
+       subtitle="Pre/Post")+
+  theme_fancy()+
+  theme(legend.title=element_blank())
+
+```
+
+The first thing we need to do is check for equal variance in the pre-period. If the p-value of Levene's test is <.05 then we can reject the null hypothesis that variance is equal.
+
+```{r var_check}
+leveneTest(sales ~ factor(treat), data = sales_data%>%
+             filter(post==0), center = median)
+```
+
+Levene's test shows a non-sig p-value, so we conclude that the null hypothesis that variance is equal is correct.
+
+If we had non-normal data we could run Fligner's test
+
+```{r non_norm}
+# Non-normal data
+fligner.test(sales ~ factor(treat), data = sales_data%>%
+               filter(post==0))
+```
+
+Quick visual seasonality check shows there is not day-of-week seasonality, but clear seasonality we baked into the data. We added a noise component so that we can identify if these checks are able to separate out normal variance over a longer period.
+```{r seas}
+# Day-of-week
+day<-sales_data %>%
+  mutate(group = if_else(treat==1,"Treated","Control"),
+         wday = weekdays(date)) %>%
+  group_by(wday, group) %>%
+  summarize(mean_sales = mean(sales)) %>%
+  ggplot(aes(wday, mean_sales, fill = group)) +
+  geom_col(position = position_dodge())+
+  labs( title = "Day of Week Sales",
+        x = "Group (0 = Control, 1 = Treated)",
+        y = "Sales") +
+  theme_fancy()
+
+# Month
+mo<-sales_data %>%
+  mutate(group = if_else(treat==1,"Treated","Control"),
+         month = format(date, "%m")) %>%
+  group_by(month, group) %>%
+  summarize(mean_sales = mean(sales)) %>%
+  ggplot(aes(month, mean_sales, group=group, color=group)) + 
+  geom_line(size=1.1)+
+  geom_vline(xintercept = 3, linetype="dashed", color="red") +
+  labs( title = "Monthly Sales",
+        x = "Group (0 = Control, 1 = Treated)",
+        y = "Sales") +
+  theme_fancy()
+
+day/mo
+```
+
+The next thing we need to do is check for auto-correlation between time series. This would be a concern if we introduced some kind of incentive for the treatment and there was contamination in the control and potential exposure from network effects or de-linked user/session IDs.
+
+```{r autocorre}
+library(feasts) 
+
+sales_ts <- sales_data %>%
+  mutate(group = if_else(treat==1,"Treated","Control"))%>%
+  group_by(date, group)%>%
+  summarize(sales=sum(sales))%>%
+  ungroup()%>%
+  as_tsibble(key = group, index = date)   
+
+# ACF
+acf_df <- sales_ts %>%
+  ACF(sales)
+
+# PACF
+pacf_df <- sales_ts %>%
+  PACF(sales)
+
+# Plot
+acf_fig <- acf_df %>%
+  autoplot() +
+  labs(title = "ACF by Treatment Group")+
+  theme_fancy()
+
+pacf_fig <- pacf_df %>%
+  autoplot()+
+  labs(title = "PACF by Treatment Group")+
+  theme_fancy()
+
+acf_fig/pacf_fig
+
+```
+
+Nothing alarming that we did not already know from the DGP.
+
+If the data is IID and satisfies SUTVA we can use difference-in-means and a T-test to measure pre/post diff
+
+```{r diffmean}
+
+diff_means <- sales_data %>%
+  filter(post==0)%>%
+  group_by(date, treat)%>%
+  summarize(sales=sum(sales))%>%
+  ungroup()%>%
+  specify(sales ~ treat) %>%
+  calculate("diff in means")
+
+diff_means
+
+```
+
+There is a difference, now let's run 1K bootstrap samples to get confidence intervals around our difference.
+
+```{r boot, warning=FALSE}
+boot_means <- sales_data %>%
+  filter(post==0)%>%
+  group_by(date, treat)%>%
+  summarize(sales=sum(sales))%>%
+  ungroup()%>%
+  specify(sales ~ treat)%>%
+  infer::generate(reps = 1000, type = "bootstrap") %>% 
+  calculate("diff in means")
+
+boostrapped_confint <- boot_means%>%
+  get_confidence_interval()
+
+boot_means %>% 
+  visualize() + 
+  shade_confidence_interval(boostrapped_confint,
+                            color = "#8bc5ed", fill = "#85d9d2") +
+  geom_vline(xintercept = diff_means$stat, size = 1, color = "#77002c") +
+  labs(title = "Bootstrapped distribution of differences in means",
+       x = "Treat - Untreated", y = "Count",
+       subtitle = "Red line shows observed difference; shaded area shows 95% confidence interval") +
+  theme_fancy()
+```
+
+Next we create a null distribution to check if our observed mean differnce is within the distribution.
+
+```{r nulldist, warning=FALSE}
+diffs_null <- sales_data %>%
+  filter(post==0)%>%
+  group_by(date, treat)%>%
+  summarize(sales=sum(sales))%>%
+  ungroup()%>%
+  specify(sales ~ treat) %>% 
+  infer::hypothesize(null = "independence") %>% 
+  infer::generate(reps = 1000, type = "permute") %>% 
+  calculate("diff in means")
+
+diffs_null %>% 
+  visualize() + 
+  geom_vline(xintercept = diff_means$stat, size = 1, color = "#77002c") +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Simulated difference in sales (Treated - Untreated)", y = "Count",
+       title = "Simulation-based null distribution of differences in means",
+       subtitle = "Red line shows observed difference") +
+  theme_fancy()
+
+diffs_null %>% 
+  infer::get_p_value(obs_stat = diff_means, direction = "both")
+```
+
+Our p-value of zero suggests that the effect cannot exist in the null world.
+
+The last check I like to do is the Kolmogorov–Smirnov (KS) Test A KS test is a comparison of the CDF of both datasets. We use this test because we want to know about more than just the mean, but how the tails of the dataset differ. This tells us if the datasets are structurally different across the entire range of observations. Additionally the KS test makes no assumptions about normality, equal variances, or linear relationships. It shows WHERE the groups differ.
+
+```{r ks_test}
+# Grid of sales values
+grid <- sales_data %>% 
+  filter(post==0)%>%
+  distinct(sales) %>% 
+  arrange(sales)
+
+# Define ECDF functions for each group
+ecdf_treated_fun <- ecdf(sales_data$sales[sales_data$treat == 1])
+ecdf_control_fun <- ecdf(sales_data$sales[sales_data$treat == 0])
+
+# Wide ECDF data (one row per sales value, columns for each group's ECDF)
+ecdf_wide <- grid %>%
+  mutate(ecdf_treated = ecdf_treated_fun(sales),
+         ecdf_control = ecdf_control_fun(sales),
+         diff = abs(ecdf_treated - ecdf_control)
+  )
+
+# KS point (where the ECDF difference is maximal)
+ks_point <- ecdf_wide %>% 
+  slice_max(diff, n = 1)
+
+# Long-format ECDF data frame used in ggplot
+ecdf_wide %>%
+  pivot_longer(cols  = c(ecdf_treated, ecdf_control),
+               names_to  = "treat",
+               values_to = "ecdf",
+               names_prefix = "ecdf_" ) %>%
+  mutate(
+    treat = dplyr::case_when(
+      treat == "treated" ~ "Treated",
+      treat == "control" ~ "Control",
+      TRUE ~ treat))%>%
+  ggplot() +
+  geom_step(
+    aes(x = sales, y = ecdf, color = treat),
+    linewidth = 1) +
+  geom_segment(
+    data = ks_point,
+    aes(x = sales, xend = sales,
+        y = ecdf_treated, yend = ecdf_control),
+    color = "black", linetype = "dashed", linewidth=1) +
+  annotate(
+    "text",
+    x = ks_point$sales,
+    y = max(ks_point$ecdf_treated, ks_point$ecdf_control),
+    label = paste0("KS = ", round(ks_point$diff, 3)),
+    vjust = -0.5, hjust = -0.2,
+    size = 5) +
+  labs(
+    title = "Kolmogorov–Smirnov Test Visualization",
+    subtitle = "ECDF Comparison: Treated vs Control",
+    x = "Sales",
+    y = "ECDF",
+    color = "Group") +
+  theme_fancy() +
+  scale_color_manual(
+    values = c("Control" = "#1f78b4",
+               "Treated" = "#e31a1c"))
+
+```
+
+Cool, more of what we know, there is a mean difference between the two datasets, but the tails are similar. This demonstrates an average effect with no skewness.
+
+Finally we run an Event Study, which is really just a fancy form of linear regression, but provides us with cluster-robust standard errors because we have multiple treated and control units. If we just had 1 of each we could just use regression with the equation sales ~ post. We are careful to estimate the treatment effect in treated vs control for every relative time period around the intervention. The coefficients should cluster around 0.
+
+```{r event}
+# Create relative time (days to/from intervention)
+sales_data <- sales_data %>%
+  mutate(rel_time = as.integer(date - intervention_date))
+
+es_nospend <- feols(
+  sales ~ i(rel_time, treat, ref = -1) | city + date,
+  data = sales_data, cluster = "city"
+)
+
+es_spend <- feols(
+  sales ~ spend + i(rel_time, treat, ref = -1) | city + date,
+  data = sales_data, cluster = "city"
+)
+
+event_df_spend <- broom::tidy(es_spend, conf.int = TRUE) %>%
+  filter(str_detect(term, "rel_time")) %>%
+  mutate(rel_time = as.integer(str_extract(term, "-?\\d+"))) %>%
+  arrange(rel_time)
+
+ggplot(event_df_spend, aes(x = rel_time, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  labs(
+    title = "Event-Study: Pre/Post Treatment Effects (controlling for spend)",
+    x = "Days Relative to Campaign",
+    y = "Estimated Effect on Sales"
+  ) +
+  theme_fancy()
+
+```
+
+For learning's sake here is what regression would look like
+
+```{r salesreg}
+# Regression, no spend
+pre_data <- sales_data %>% filter(post == 0)
+
+pre_trend_test <- lm(sales ~ as.numeric(date) * treat,
+                     data = pre_data)
+
+summary(pre_trend_test)
+
+report::report(pre_trend_test)
+
+```
+
+That's it! We have accounted for:
+
+* Equal variance in the pre-period.
+* Autocorrelation.
+* A consistent difference in the pre-period trend.
+* Determining if the difference is significant with either an Event Study or Linear Regression.
+
+Now instead of running this code over and over I have written a helper function that runs all these tests and returns the results.
+
+```{r diag, warning=FALSE}
+diag_results <- pre_treatment_diagnostics(
+  data = sales_data%>%
+    filter(post==0),
+  outcome = "sales",
+  treat = "treat",
+  time = "date",
+  post = "post",
+  intervention_date = intervention_date,  
+  do_event_study = TRUE                  
+)
+```
+
+
+This function returns a pre-period parallel trends plot
+```{r trendplot}
+diag_results$pre_trends_plot
+```
+
+and all other plots!
+```{r plots}
+diag_results$pre_trends_plot
+diag_results$ks_ecdf_plot
+diag_results$ks_density_plot
+diag_results$ slope_comparison_plot
+diag_results$event_study_plot  
+```
+
+```{r slopes}
+summary(diag_results$slope_model)
+```
+
+We can even inspect Levene's test results. All of the tests above are objects of the data frame that the function outputs.
+```{r levene}
+diag_results$levene_test
+```
+
+If we want to get really fancy we could use CausalImpact to also answer if there was a significant difference in only the post period. We pass the function the treatment time series as the first column and the control series is used as a covariate.
+
+```{r causal}
+sales_control<-sales_data%>%
+  filter(treat==0)%>%
+  group_by(date)%>%
+  summarize(control_sales=sum(sales),
+            control_spend=sum(spend))%>%
+  ungroup()
+
+sales_treat<-sales_data%>%
+  filter(treat==1)%>%
+  group_by(date)%>%
+  summarize(treat_sales=sum(sales),
+            treat_spend=sum(spend))%>%
+  ungroup()
+
+# Define pre- and post-intervention periods 
+dates <- seq.Date(as.Date(min(sales_treat$date)),
+                  by=1, 
+                  length.out = length(sales_treat$date))
+
+pre_period <- as.Date(c(min(sales_treat$date), intervention_date-1))
+
+post_period <- as.Date(c(intervention_date, max(sales_treat$date)))
+
+sales_zoo<-zoo(cbind(sales_treat$treat_sales, 
+                     sales_control$control_sales), order.by=dates)
+
+# Causal for non smoothed data
+sales_impact <- CausalImpact(sales_zoo, pre_period, post_period)
+
+# Results summary
+summary(sales_impact, "report")
+
+# Plot
+plot(sales_impact)+
+  theme_fancy()+
+  labs(x="Date",
+       y="Effect",
+       title="CausalImpact Estimate Sales Increase",
+       subtitle=paste(round(sales_impact$summary$RelEffect,3)*100,
+                      "% lift",
+                      ",", 
+                      "p=",
+                      round(sales_impact$summary$p,3)))
+
+```
+
+## Appendix
+
+Complete List of causal pre-checks available in the function
+1. Pre-period subset (pre_data): Filters the data to only observations before treatment starts (where post == 0) so all diagnostics reflect pre-treatment comparability rather than post effects.
+2. Equal-means t-test (mean_test): Tests whether the treated and control groups have the same average outcome in the pre-period. A significant result suggests baseline level differences that can make DiD estimates more sensitive to functional form or weighting.
+3. Levene’s test for equal variance (levene_test): Tests whether the pre-period outcome variance is the same in treated vs control (median-centered for robustness). Large variance differences can indicate heteroskedasticity or fundamentally different outcome volatility between groups.
+4. Fligner–Killeen test for equal variance (fligner_test): A nonparametric, robust test of whether treated and control have equal pre-period variances. It’s less sensitive to non-normality than Levene’s and is a good confirmation check for variance imbalance.
+5. Two-sample KS test (pooled pre) (ks_test): Tests whether the entire pre-period outcome distributions differ between treated and control, not just the means/variances. A significant KS result flags distributional mismatch (e.g., different skew/tails) that can violate the “comparability” intuition behind parallel trends.
+6. KS ECDF plot (ks_ecdf_plot): Visual companion to the KS test showing the treated vs control empirical CDFs in pre-period. It helps identify where the distributions diverge (e.g., lower tail vs upper tail), even when p-values are borderline.
+7. KS density plot (ks_density_plot): Visual comparison of treated vs control pre-period densities. Useful for seeing multimodality, heavy tails, or scaling differences that can hide behind mean-based checks.
+8. Parallel-trend slope test (linear interaction) (slope_model, slope_p_value): Fits outcome ~ time * treat on pre data and tests whether the treated group’s trend slope differs from control via the time×treat interaction. A significant interaction suggests a violation of linear parallel trends in the pre-period.
+9. Slope comparison plot (slope_comparison_plot): Plots pre-period average outcomes over time with separate fitted lines by group. It provides an intuitive visual check of whether treated and control trends are aligned and whether divergence is gradual or localized.
+10. Pre-period parallel trends plot (pre_trends_plot): Plots treated and control pre-period mean outcomes over time without imposing a model, letting you visually assess alignment, seasonality, and any obvious pre divergence.
+11. Nonlinear shape check via spline interaction (curvature_model, curvature_p_value): Tests whether treated vs control differ in trend shape (curvature) in the pre-period by interacting treatment with a flexible spline basis of time. This catches non-parallel trends that aren’t well described by a single linear slope difference.
+12. Curvature plot (curvature_plot): Visualizes potential nonlinear pre-trend differences by plotting group averages with a smooth curve. It helps diagnose whether departures from parallel trends are due to curvature/seasonality rather than a constant slope gap.
+13.Seasonality-adjusted slope test (seasonality_slope_model, seasonality_slope_p_value): Re-runs the pre-period slope interaction while controlling for calendar patterns (e.g., day-of-week and month effects) so that “trend differences” aren’t just seasonality differences. If the interaction becomes non-significant after adjustment, the apparent violation may be seasonal rather than structural.
+14. Seasonality-adjusted trends plot (seasonality_slope_plot): A visualization to accompany the seasonality-adjusted slope test, helping you see whether divergence is concentrated in specific calendar cycles even when overall pre trends look similar.
+15. Calendar composition balance test (chi-square on day-of-week) (calendar_balance_test, calendar_balance_p_value): Tests whether treated and control have different coverage/composition across calendar categories (e.g., weekdays) in the pre-period. Imbalance can create artificial trend differences if one group disproportionately contains higher-variance or systematically higher/lower calendar days.
+16. Rolling-window KS distance (rolling_distance_df / ks_D): Computes KS distance in rolling pre-period windows to detect time-localized distribution divergence (e.g., the last few pre weeks drifting). This is useful when pooled pre-period KS looks fine but mismatch emerges closer to treatment.
+17, Rolling-window Wasserstein distance (rolling_distance_df / wasserstein): Computes a magnitude-of-shift metric (Earth-mover style) between treated and control distributions in rolling windows. It’s often more interpretable than KS because it reflects “how far” the distributions are apart, not only the maximum CDF gap.
+18. Rolling-distance plot (rolling_distance_plot): Plots rolling KS and Wasserstein distances over pre time. Spikes or upward drift near the intervention date are a red flag for emerging non-parallelism or unobserved shocks affecting groups differently.
+19. Unit-level pre slope distribution comparison (unit_slope_df, unit_slope_t_test, unit_slope_ks_test): Estimates a pre-period slope separately for each unit and compares the distribution of unit slopes between treated and control. This checks whether treated units are systematically on different trajectories even if aggregate means look parallel.
+20. Unit-level slope distribution plot (unit_slope_plot): Visualizes heterogeneity/composition differences by showing treated vs control distributions of per-unit pre slopes (e.g., via violin/boxplot). It helps detect whether imbalance is driven by a subset of units with atypical trajectories.
+21. Robust slope interaction (M-estimation via rlm) (robust_slope_model, robust_interaction_p): Fits the same pre slope interaction using a robust regression less sensitive to outliers and heavy tails. If OLS shows a violation but robust does not (or vice versa), results may be driven by a few extreme points.
+22. Influence diagnostics (Cook’s distance) (cooks_plot, top_influential): Measures how much individual observations influence the pre-period slope model, highlighting points that disproportionately drive the interaction term. This helps determine whether a “parallel trends failure” is broad-based or due to a handful of anomalous dates/units.
+23. Pre-only placebo event study (lead coefficients) (placebo_event_study_model, placebo_event_study_plot): Runs an event-study-style model using only pre data and examines the “lead” coefficients (relative times before treatment), which should be near zero if pre trends are parallel. Systematic non-zero leads indicate pre divergence and undermine the DiD identifying assumption.
+24. Joint test of placebo leads (placebo_leads_joint_test, placebo_leads_p_value): Tests whether all pre-period lead coefficients are jointly zero in the placebo event study. This is a more powerful, omnibus check than inspecting individual lead p-values one-by-one.
