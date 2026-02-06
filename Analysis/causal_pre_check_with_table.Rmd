@@ -1,7 +1,6 @@
 ---
 title: "Parallel Trends Pre-Checks"
 output: github_document
-date: "2026-02-05"
 ---
 
 ```{r setup, include=FALSE}
