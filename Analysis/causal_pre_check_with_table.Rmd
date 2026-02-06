@@ -127,7 +127,7 @@ Let's check out our data real quick
 report::report(sales_data%>%
                  select(-date))
 
-kbl(sales_data %>%
+sales_data %>%
   group_by(treat, city) %>%
   summarize(
     mean_sales = mean(sales, na.rm = TRUE),
@@ -138,8 +138,7 @@ kbl(sales_data %>%
     min_date = min(date),
     max_date = max(date)
   )%>%
-  arrange(city, treat))%>%
-  kable_minimal()
+  arrange(city, treat)
 
 ```
 Looks good, no missingness and plenty of variation that we built in.
