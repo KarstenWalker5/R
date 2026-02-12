@@ -177,3 +177,61 @@ pre_treatment_diagnostics <- function(data,
   
   invisible(results)
 }
+
+pre_treatment_diagnostics_panel <- function(data,
+                                            outcome,
+                                            treat,
+                                            time,
+                                            unit,
+                                            intervention_date,
+                                            transform = c("none", "log1p"),
+                                            agg = mean,
+                                            do_event_study = FALSE,
+                                            ...) {
+  transform <- match.arg(transform)
+  
+  stopifnot(all(c(outcome, treat, time, unit) %in% names(data)))
+  stopifnot(!is.null(intervention_date))
+  
+  df <- data %>%
+    dplyr::mutate(
+      .time  = .data[[time]],
+      .treat = .data[[treat]],
+      .unit  = .data[[unit]],
+      .y_raw = .data[[outcome]],
+      .y = dplyr::if_else(transform == "log1p", log1p(.y_raw), as.numeric(.y_raw)),
+      post = dplyr::if_else(.time >= intervention_date, 1L, 0L)
+    )
+  
+  # Collapse to treated/control mean series by time
+  collapsed <- df %>%
+    dplyr::group_by(.time, .treat) %>%
+    dplyr::summarise(
+      y_mean  = agg(.y, na.rm = TRUE),          # <-- renamed from "outcome" to "y_mean"
+      n_units = dplyr::n_distinct(.unit),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      post = dplyr::if_else(.time >= intervention_date, 1L, 0L),
+      grp_unit = dplyr::if_else(.treat == 1, "TreatedMean", "ControlMean")
+    )
+  
+  res <- pre_treatment_diagnostics(
+    data = collapsed %>%
+      dplyr::rename(!!time := .time, !!treat := .treat, !!unit := grp_unit),
+    outcome = "y_mean",                          # <-- pass the new safe name
+    treat   = treat,
+    time    = time,
+    post    = "post",
+    unit    = unit,
+    intervention_date = intervention_date,
+    do_event_study = do_event_study,
+    ...
+  )
+  
+  list(
+    intervention_date = intervention_date,
+    collapsed_means = collapsed,
+    results = res
+  )
+}

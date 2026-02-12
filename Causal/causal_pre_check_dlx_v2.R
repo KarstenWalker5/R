@@ -763,9 +763,42 @@ pre_treatment_diagnostics <- function(data,
     cat("Event study model estimated: no (set do_event_study = TRUE to add)\n")
   }
   cat("=================================\n")
+
+  # A tidy summary table (returned) matching the console printout
+  summary_table <- dplyr::tibble(
+    check = c(
+      paste0("Equal-means t-test (", outcome, ") p-value"),
+      "Levene variance-equality p-value",
+      "Fligner variance-equality p-value",
+      "KS distributional-equality p-value",
+      "Parallel-trend slope (time*treat) p-value",
+      "Nonlinear shape (spline interaction) p-value",
+      "Seasonality-adjusted slope p-value",
+      "Calendar composition (DOW chi-square) p-value",
+      "Robust slope interaction p-value",
+      "Pre-only placebo event study (lead joint) p-value",
+      "Event study estimated"
+    ),
+    value = c(
+      as.numeric(mean_test$p.value),
+      as.numeric(levene_p),
+      as.numeric(fligner_p),
+      as.numeric(ks_p),
+      as.numeric(slope_p),
+      as.numeric(curvature_p_value),
+      as.numeric(seasonality_slope_p_value),
+      as.numeric(calendar_balance_p_value),
+      as.numeric(robust_interaction_p),
+      as.numeric(placebo_leads_p_value),
+      ifelse(isTRUE(do_event_study), "yes", "no")
+    )
+  )
+
+  results$summary_table <- summary_table
   
   invisible(results)
 }
+
 
 pre_treatment_diagnostics_panel <- function(data,
                                             outcome,
@@ -773,30 +806,43 @@ pre_treatment_diagnostics_panel <- function(data,
                                             time,
                                             unit,
                                             intervention_date,
+                                            post = NULL,
                                             transform = c("none", "log1p"),
                                             agg = mean,
                                             do_event_study = FALSE,
+                                            gap_window = 14,
                                             ...) {
+  # Panel wrapper that:
+  #  1) builds a transformed outcome (optional log1p),
+  #  2) collapses to treated/control mean series by time (to reuse existing plots/tests),
+  #  3) adds *panel-appropriate* gap-stability diagnostics (rolling mean + rolling SD of the treated-control gap).
   transform <- match.arg(transform)
-  
+
   stopifnot(all(c(outcome, treat, time, unit) %in% names(data)))
   stopifnot(!is.null(intervention_date))
-  
+
   df <- data %>%
     dplyr::mutate(
       .time  = .data[[time]],
       .treat = .data[[treat]],
       .unit  = .data[[unit]],
       .y_raw = .data[[outcome]],
-      .y = dplyr::if_else(transform == "log1p", log1p(.y_raw), as.numeric(.y_raw)),
       post = dplyr::if_else(.time >= intervention_date, 1L, 0L)
     )
-  
-  # Collapse to treated/control mean series by time
+
+  # outcome transform (transform is a scalar option; avoid dplyr::if_else())
+  if (transform == "log1p") {
+    df <- df %>% dplyr::mutate(.y = log1p(as.numeric(.y_raw)))
+  } else {
+    df <- df %>% dplyr::mutate(.y = as.numeric(.y_raw))
+  }
+
+
+  # Collapse to treated/control mean series by time (one row per time x treat)
   collapsed <- df %>%
     dplyr::group_by(.time, .treat) %>%
     dplyr::summarise(
-      y_mean  = agg(.y, na.rm = TRUE),          # <-- renamed from "outcome" to "y_mean"
+      y_mean  = agg(.y, na.rm = TRUE),
       n_units = dplyr::n_distinct(.unit),
       .groups = "drop"
     ) %>%
@@ -804,11 +850,14 @@ pre_treatment_diagnostics_panel <- function(data,
       post = dplyr::if_else(.time >= intervention_date, 1L, 0L),
       grp_unit = dplyr::if_else(.treat == 1, "TreatedMean", "ControlMean")
     )
-  
+
+  # Run the original diagnostics on the collapsed data.
+  # NOTE: Some outputs (e.g., Levene/Fligner/pooled KS) are not meaningful when collapsed to 2 series;
+  # the added gap diagnostics below are the recommended replacement for "variance equality" in the 1-vs-1 geography setting.
   res <- pre_treatment_diagnostics(
     data = collapsed %>%
       dplyr::rename(!!time := .time, !!treat := .treat, !!unit := grp_unit),
-    outcome = "y_mean",                          # <-- pass the new safe name
+    outcome = "y_mean",
     treat   = treat,
     time    = time,
     post    = "post",
@@ -817,10 +866,206 @@ pre_treatment_diagnostics_panel <- function(data,
     do_event_study = do_event_study,
     ...
   )
+
+  # ------------------------------------------------------------
+  # NEW (panel-appropriate): gap series + rolling mean/sd in PRE
+  # ------------------------------------------------------------
+  # Build treated-control gap from *collapsed means* (so it works even when the original panel has 1 treated unit).
+  gap_series <- collapsed %>%
+    dplyr::select(.time, .treat, y_mean, post) %>%
+    tidyr::pivot_wider(names_from = .treat, values_from = y_mean) %>%
+    dplyr::rename(control = `0`, treated = `1`) %>%
+    dplyr::mutate(gap = treated - control) %>%
+    dplyr::arrange(.time)
+
+  gap_pre <- gap_series %>%
+    dplyr::filter(.time < intervention_date) %>%
+    dplyr::arrange(.time)
+
+  gap_roll <- NULL
+  gap_roll_plot <- NULL
+
+  if (nrow(gap_pre) >= gap_window) {
+    if (requireNamespace("slider", quietly = TRUE)) {
+      gap_roll <- gap_pre %>%
+        dplyr::mutate(
+          roll_mean = slider::slide_dbl(gap, mean, .before = gap_window - 1, .complete = TRUE),
+          roll_sd   = slider::slide_dbl(gap, sd,   .before = gap_window - 1, .complete = TRUE)
+        )
+    } else if (requireNamespace("zoo", quietly = TRUE)) {
+      gap_roll <- gap_pre %>%
+        dplyr::mutate(
+          roll_mean = zoo::rollapply(gap, width = gap_window, FUN = mean, align = "right", fill = NA),
+          roll_sd   = zoo::rollapply(gap, width = gap_window, FUN = sd,   align = "right", fill = NA)
+        )
+    } else {
+      warning("Rolling gap stats require either the 'slider' or 'zoo' package. Returning gap_roll = NULL.")
+      gap_roll <- NULL
+    }
+
+    gap_roll_plot <- if (!is.null(gap_roll)) gap_roll %>%
+      tidyr::pivot_longer(cols = c("roll_mean", "roll_sd"), names_to = "metric", values_to = "value") %>%
+      ggplot2::ggplot(ggplot2::aes(x = .time, y = value, linetype = metric)) +
+      ggplot2::geom_line(linewidth = 1) +
+      ggplot2::labs(
+        title = "Pre-period Treated–Control Gap Stability (Rolling)",
+        subtitle = paste0("Window = ", gap_window, " time points; outcome = ", transform, "(", outcome, ")"),
+        x = time,
+        y = "Value",
+        linetype = ""
+      ) +
+      ggplot2::theme_minimal()
+    else NULL
+  }
+
+  # -------------------------
+  # Panel summary table (appropriate 1 treated / 1 control diagnostics)
+  # -------------------------
+  # Pull the most relevant p-values from the underlying diagnostics
+  slope_p <- tryCatch(res$slope_p_value, error = function(e) NA_real_)
+  curvature_p <- tryCatch(res$curvature_p_value, error = function(e) NA_real_)
+  seasonality_p <- tryCatch(res$seasonality_slope_p_value, error = function(e) NA_real_)
+  placebo_p <- tryCatch(res$placebo_leads_p_value, error = function(e) NA_real_)
   
+  roll_sd_mean <- if (!is.null(gap_roll)) mean(gap_roll$roll_sd, na.rm = TRUE) else NA_real_
+  roll_sd_max  <- if (!is.null(gap_roll)) max(gap_roll$roll_sd,  na.rm = TRUE) else NA_real_
+  roll_mean_abs_max <- if (!is.null(gap_roll)) max(abs(gap_roll$roll_mean), na.rm = TRUE) else NA_real_
+
+  summary_table <- dplyr::tibble(
+    check = c(
+      "Pre-period differential slope (collapsed series) p-value",
+      "Pre-period nonlinear shape (collapsed series) p-value",
+      "Seasonality-adjusted differential slope (collapsed series) p-value",
+      "Pre-only placebo event study (lead joint) p-value",
+      paste0("Gap rolling SD mean (window=", gap_window, ")"),
+      paste0("Gap rolling SD max (window=", gap_window, ")"),
+      paste0("Gap rolling mean |max| (window=", gap_window, ")"),
+      "Event study estimated"
+    ),
+    value = c(
+      as.numeric(slope_p),
+      as.numeric(curvature_p),
+      as.numeric(seasonality_p),
+      as.numeric(placebo_p),
+      as.numeric(roll_sd_mean),
+      as.numeric(roll_sd_max),
+      as.numeric(roll_mean_abs_max),
+      ifelse(isTRUE(do_event_study), "yes", "no")
+    )
+  )
+
+  # Console print (similar style to the base function)
+  cat("\n=== Pre-Treatment Diagnostics (Panel Wrapper) ===\n")
+  cat("Outcome used: ", transform, "(", outcome, ")\n", sep = "")
+  cat("Differential slope p-value: ", signif(as.numeric(slope_p), 3), "\n", sep = "")
+  cat("Nonlinear shape p-value: ", signif(as.numeric(curvature_p), 3), "\n", sep = "")
+  cat("Seasonality-adjusted slope p-value: ", signif(as.numeric(seasonality_p), 3), "\n", sep = "")
+  cat("Placebo lead joint-test p-value: ", signif(as.numeric(placebo_p), 3), "\n", sep = "")
+  cat("Gap rolling SD (mean/max): ", signif(roll_sd_mean, 3), " / ", signif(roll_sd_max, 3), "\n", sep = "")
+  cat("Gap rolling mean |max|: ", signif(roll_mean_abs_max, 3), "\n", sep = "")
+  cat("===============================================\n")
+
   list(
     intervention_date = intervention_date,
-    collapsed_means = collapsed,
-    results = res
+    collapsed_means   = collapsed,
+    gap_series        = gap_series,
+    gap_rolling_df    = gap_roll,
+    gap_rolling_plot  = gap_roll_plot,
+    results           = res,
+    summary_table     = summary_table
   )
 }
+
+# ------------------------------------------------------------------
+# Auto-mode: detect dataset structure and apply the right checks
+# ------------------------------------------------------------------
+pre_treatment_diagnostics_auto <- function(data,
+                                           outcome = "sales",
+                                           treat = "treat",
+                                           time = "date",
+                                           post = "post",
+                                           unit = "city",
+                                           intervention_date = NULL,
+                                           transform = c("none", "log1p"),
+                                           do_event_study = FALSE,
+                                           gap_window = 14,
+                                           ...) {
+  transform <- match.arg(transform)
+
+  stopifnot(all(c(outcome, treat, time, unit) %in% names(data)))
+
+  # Infer intervention_date if not provided (from post==1)
+  if (is.null(intervention_date)) {
+    if (!post %in% names(data)) stop("post column not found; pass intervention_date explicitly.")
+    intervention_date <- data %>%
+      dplyr::filter(.data[[post]] %in% c(1, TRUE)) %>%
+      dplyr::summarise(first_post = min(.data[[time]], na.rm = TRUE)) %>%
+      dplyr::pull(first_post)
+    if (length(intervention_date) == 0 || is.infinite(intervention_date)) {
+      stop("Could not infer intervention_date; pass intervention_date explicitly.")
+    }
+  }
+
+  # Count distinct units per group
+  gcounts <- data %>%
+    dplyr::mutate(.t = .data[[treat]], .u = .data[[unit]]) %>%
+    dplyr::group_by(.t) %>%
+    dplyr::summarise(n_units = dplyr::n_distinct(.u), .groups = "drop")
+
+  n_treated_units <- gcounts %>% dplyr::filter(.t == 1) %>% dplyr::pull(n_units)
+  n_control_units <- gcounts %>% dplyr::filter(.t == 0) %>% dplyr::pull(n_units)
+  n_treated_units <- ifelse(length(n_treated_units) == 0, 0, n_treated_units)
+  n_control_units <- ifelse(length(n_control_units) == 0, 0, n_control_units)
+
+  # Heuristic:
+  #  - If both treated and control have >= 2 units -> run full panel diagnostics on original panel.
+  #  - Otherwise -> treat as "single-treated" / CITS-like and run the panel wrapper which adds gap stability checks.
+  if (n_treated_units >= 2 && n_control_units >= 2) {
+    # Create transformed outcome column (so the base function can use it)
+    df2 <- data %>%
+      {
+      if (transform == "log1p") {
+        dplyr::mutate(.y_used = log1p(as.numeric(.data[[outcome]])))
+      } else {
+        dplyr::mutate(.y_used = as.numeric(.data[[outcome]]))
+      }
+    }
+    res <- pre_treatment_diagnostics(
+      data = df2,
+      outcome = ".y_used",
+      treat = treat,
+      time = time,
+      post = post,
+      unit = unit,
+      intervention_date = intervention_date,
+      do_event_study = do_event_study,
+      ...
+    )
+
+    list(
+      mode = "panel_many_units",
+      intervention_date = intervention_date,
+      n_treated_units = n_treated_units,
+      n_control_units = n_control_units,
+      results = res
+    )
+  } else {
+    out <- pre_treatment_diagnostics_panel(
+      data = data,
+      outcome = outcome,
+      treat = treat,
+      time = time,
+      unit = unit,
+      intervention_date = intervention_date,
+      transform = transform,
+      do_event_study = do_event_study,
+      gap_window = gap_window,
+      ...
+    )
+    out$mode <- "panel_single_treated_or_control"
+    out$n_treated_units <- n_treated_units
+    out$n_control_units <- n_control_units
+    out
+  }
+}
+

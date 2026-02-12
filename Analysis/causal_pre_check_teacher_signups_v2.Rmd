@@ -1,0 +1,398 @@
+---
+title: "Parallel Trends Pre-Checks"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(fig.width=15, fig.height=10) 
+```
+
+In this script we walk through boilerplate causal pre-checks to determine if our data meets the parallel trends assumption in the pre period. We only look at the most essential functions as there are many more esoteric checks contained in our helper script documented below that are likely not always necessary. Please see the appendix for a list of functions and their use.
+
+###### Steps ######
+1. Basic visual inspection of pre/post campaign to examine parallel trends assumption.
+2. Analysis of variance in pre/post sales data.
+3. Optional: Event study comparison to determine the difference between between pre/post, which helps us determine if the difference is a function of surrounding time periods OR the intervention.
+4. We use linear regression to compare pre-intervention trends between groups.
+
+```{r load_packages, warnings=FALSE, message=FALSE}
+
+# Load required packages
+packages <- c(
+  "dplyr",
+  "tidyr",
+  "tidyverse",
+  "patchwork",
+  "broom",
+  "CausalImpact",
+  "scales",
+  "lubridate",
+  "lmtest",
+  "sandwich",
+  "fixest",
+  "car",
+  "feasts",
+  "infer",
+  "corrr",
+  "kableExtra",
+  "slider"
+)
+
+installed <- rownames(installed.packages())
+to_install <- setdiff(packages, installed)
+
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+suppressPackageStartupMessages(
+  lapply(packages, library, character.only = TRUE)
+)
+
+# Set seed for synthetic data gen and model fitting
+set.seed(7)
+
+# Load theme
+source("/Users/karstenwalker/Documents/GitHub/R/Helpers/themes.R")
+
+# Load causal pre-check function
+source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_pre_check.R")
+
+```
+
+For this example we are going to generate synthetic data that contains 10 cities: 5 have been treated and 5 have not. We design the data such that there are parallel pre-period trends and there is a significant increase in only the treated cities. There is also a spend column which differs across cities that we can add as a unit effect for a TWFE model.
+
+```{r synth_data}
+teacher_signups<-read.csv(file="/Users/karstenwalker/Downloads/teacher_signups.csv")%>%
+  mutate(date=ymd(date),
+         treat=as.factor(ifelse(country_code=="US",1,0)),
+         intervention_date=ymd("2026-01-06"),
+         post=ifelse(date>="2026-01-06",1,0),
+         num_teachers=ifelse(country_code=="CA", num_teachers/20, num_teachers),
+         num_teacher_signups=ifelse(country_code=="CA", num_teacher_signups/20, num_teacher_signups)
+         )%>%
+  group_by(country_code)%>%
+  arrange(date)%>%
+  mutate(num_teachers_7d = slide_dbl(
+                                .x = num_teachers,
+                                .f = mean,
+                                .before = 7, # Includes the current row (.before=0) and the two preceding rows
+                                .after = 0,
+                                .complete = FALSE ))%>%
+  group_by(date)%>%
+  mutate(total_teachers=sum(num_teachers),
+         total_signups=sum(num_teacher_signups))%>%
+  ungroup()%>%
+  group_by(country_code, date)%>%
+  mutate(pct_teachers=sum(num_teachers)/total_teachers,
+         pct_signups=sum(num_teacher_signups)/total_signups)
+
+teacher_pct<-read.csv(file="/Users/karstenwalker/Downloads/teacher_pct.csv")
+
+intervention_date<-ymd("2026-01-06")
+
+```
+
+Let's check out our data real quick
+```{r data_check}
+report::report(teacher_signups%>%
+                 select(-date,-intervention_date))
+
+kbl(teacher_signups %>%
+  group_by(country_code) %>%
+  summarize(
+    mean_teachers = mean(num_teachers, na.rm = TRUE),
+    med_teachers = median(num_teachers, na.rm = TRUE),
+    min_teachers= min(num_teachers, na.rm = TRUE),
+    max_teachers= max(num_teachers, na.rm = TRUE),
+    sd_teachers = sd(num_teachers),
+    mean_pct_teachers = mean(pct_teachers, na.rm = TRUE),
+    med_pct_teachers = median(pct_teachers, na.rm = TRUE),
+    min_pct_teachers= min(pct_teachers, na.rm = TRUE),
+    max_pct_teachers= max(pct_teachers, na.rm = TRUE),
+    sd_pct_teachers = sd(pct_teachers)
+  )%>%
+  arrange(country_code))%>%
+  kable_minimal()
+
+```
+On face value the difference in SD between the US and Canada on total signups is somewhat concerning.
+
+Overall pre/post visual check
+```{r overall}
+us_signups<-teacher_signups %>%
+  filter(country_code=="US")%>%
+  ggplot(aes(x = date, y = num_teachers_7d)) +
+  geom_line(linewidth = 1, color ="lightgreen") +
+  geom_vline(xintercept = intervention_date, linetype = "dashed") +
+  geom_smooth()+
+  labs(
+    title = "Parallel Trends Check: Treated vs Control",
+    x = "Date",
+    y = "7D Rolling Average",
+    color = "Country"
+  ) +
+  theme_fancy()
+
+ca_signups<-teacher_signups %>%
+  filter(country_code!="US")%>%
+  ggplot(aes(x = date, y = num_teachers_7d)) +
+  geom_line(linewidth = 1, color = "lightblue") +
+  geom_vline(xintercept = intervention_date, linetype = "dashed") +
+  geom_smooth()+
+  labs(
+    title = "",
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_fancy()
+
+us_signups/ca_signups
+
+```
+
+If we use a 7D rolling average to smooth out daily/weekly seasonality we can see numerous differences in pre-period trends, especially in the prior 3 months.
+
+
+Quick visual seasonality check shows there is not day-of-week seasonality, but clear seasonality we baked into the data. We added a noise component so that we can identify if these checks are able to separate out normal variance over a longer period.
+```{r seas}
+# Day-of-week
+day<-teacher_signups %>%
+  filter(date<="2026-01-06")%>%
+  mutate(group = if_else(treat==1,"Treated","Control"),
+         wday = weekdays(date)) %>%
+  group_by(wday, group) %>%
+  summarize(mean_teachers = mean(num_teachers)) %>%
+  mutate(mean_teachers=ifelse(group=="Control", mean_teachers*50, mean_teachers))%>%
+  ggplot(aes(wday, mean_teachers, fill = group)) +
+  geom_col(position = position_dodge())+
+  labs( title = "Day of Week Teachers",
+        x = "Group (0 = Control, 1 = Treated)",
+        y = "Teachers") +
+  theme_fancy()
+
+# Month
+mo<-teacher_signups %>%
+  filter(date<="2026-01-06")%>%
+  mutate(group = if_else(treat==1,"Treated","Control"),
+         month = format(date, "%m")) %>%
+  group_by(month, group) %>%
+  summarize(mean_teachers = mean(num_teachers)) %>%
+  ungroup()%>%
+  mutate(mean_teachers=ifelse(group=="Control", mean_teachers*50, mean_teachers))%>%
+  ggplot(aes(month, mean_teachers, group=group, color=group)) + 
+  geom_line(size=1.1)+
+  geom_vline(xintercept = 11, linetype="dashed", color="red") +
+  labs( title = "Monthly Teacher Avg",
+        x = "Group (0 = Control, 1 = Treated)",
+        y = "Avg Teachers") +
+  theme_fancy()
+
+day/mo
+```
+
+Unfortunately we do have some slightly different day-of-week and monthly average teacher variance.
+
+The next thing we need to do is check for auto-correlation between time series. This would be a concern if we introduced some kind of incentive for the treatment and there was contamination in the control and potential exposure from network effects or de-linked user/session IDs.
+
+```{r autocorre}
+library(feasts) 
+
+teachers_ts <- teacher_signups %>%
+  mutate(group = if_else(treat==1,"Treated","Control"))%>%
+  ungroup()%>%
+  as_tsibble(key = group, index = date)   
+
+# ACF
+acf_df <- teachers_ts %>%
+  ACF(num_teachers)
+
+# PACF
+pacf_df <- teachers_ts %>%
+  PACF(num_teachers)
+
+# Plot
+acf_fig <- acf_df %>%
+  autoplot() +
+  labs(title = "ACF by Treatment Group")+
+  theme_fancy()
+
+pacf_fig <- pacf_df %>%
+  autoplot()+
+  labs(title = "PACF by Treatment Group")+
+  theme_fancy()
+
+acf_fig/pacf_fig
+
+```
+
+Nothing alarming that we did not already know.
+
+A common single-series pre-check is a Kolmogorov–Smirnov (KS) test comparing the pooled distributions across groups.  
+In a 1 treated/1 control geo setting, this is not a meaningful parallel-trends diagnostic because there is no within-time distribution to compare (each group contributes one observation per date), and pooling over time confounds time dynamics with distributional shape.
+
+Instead, we rely on gap-based, time-aware diagnostics (event study, differential trend tests, and rolling gap stability as above).
+
+The first thing that we want to understand is whether the treated–control gap is stable in the pre-period. With one treated geography and one control geography, tests like Levene/Fligner (equal variances across groups) are not appropriate because they assume many independent observations per group. Instead, we look at the rolling variance of the treated–control gap in the pre-period. A flat line would indicate that the delta never differs and a very jagged line means that the standard deviation dramatically varies over a 7 day period
+
+```{r rolling_gap_variance}
+
+intervention_date <- as.Date("2026-01-06")
+
+gap_pre <- teacher_signups %>%
+  mutate(log_teachers = log1p(num_teachers),
+    rel_time = as.integer(date - intervention_date)) %>%
+  filter(rel_time < 0) %>%
+  group_by(date, treat) %>%
+  summarise(y = mean(log_teachers, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = treat, values_from = y) %>%
+  transmute(date = date, gap = `1` - `0`) %>%
+  arrange(date) %>%
+  mutate(roll_sd_7 = slide_dbl(gap, sd, .before =6, .complete = TRUE),
+         roll_var_7 = roll_sd_7^2
+  )
+
+ggplot(gap_pre, aes(x = date, y = roll_sd_7)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "7-day Rolling SD of Treated–Control Gap (Pre-period)",
+    x = "Date",
+    y = "Rolling SD of gap (log1p)"
+  ) +
+  theme_fancy()
+```
+
+
+This plot is a simple, time-series–appropriate variance diagnostic test. If the gap’s rolling mean and rolling SD drift a lot in the pre-period, that’s evidence of instability and potential parallel-trends concerns.
+
+```{r gap_series_plot}
+# Build treated–control gap series on log scale
+gap_df <- teacher_signups %>%
+  mutate(log_teachers = log1p(num_teachers)) %>%
+  group_by(date, treat) %>%
+  summarise(mean_log_teachers = mean(log_teachers, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = treat, values_from = mean_log_teachers) %>%
+  transmute(date = date, gap = `1` - `0`) %>%
+  arrange(date) %>%
+  filter(date < intervention_date) %>%
+  mutate(roll_mean_7 = slide_dbl(gap, mean, .before = 6, .complete = TRUE),
+         roll_sd_7   = slide_dbl(gap, sd,   .before = 6, .complete = TRUE)
+  )
+
+# Rolling mean of the pre-period gap
+mean_plot<-ggplot(gap_df, aes(x = date, y = roll_mean_7)) +
+  geom_line() +
+  labs(
+    title = "Pre-period treated–control gap, 7-day rolling mean, log1p)",
+    x = "",
+    y = "Rolling Mean of gap"
+  ) +
+  theme_fancy()
+
+# Rolling SD of the pre-period gap
+sd_plot<-ggplot(gap_df, aes(x = date, y = roll_sd_7)) +
+  geom_line() +
+  labs(
+    title = "Pre-period treated–control, 7-day rolling mean, log1p",
+    x = "Date",
+    y = "Rolling SD of gap"
+  ) +
+  theme_fancy()
+
+mean_plot/sd_plot
+```
+
+Finally we run an Event Study, which is really just a fancy form of linear regression, but provides us with cluster-robust standard errors because we have multiple treated and control units. If we just had 1 of each we could just use regression with the equation sales ~ post. We are careful to estimate the treatment effect in treated vs control for every relative time period around the intervention. The coefficients should cluster around 0.
+
+```{r event}
+# Create relative time (days to/from intervention)
+teacher_signups <- teacher_signups %>%
+  mutate(rel_time = as.integer(date - intervention_date))
+
+es <- feols(
+  num_teachers ~ i(rel_time, treat, ref = -1) | country_code + date,
+  data = teacher_signups, cluster = "country_code"
+)
+
+
+event_df <- broom::tidy(es, conf.int = TRUE) %>%
+  filter(str_detect(term, "rel_time")) %>%
+  mutate(rel_time = as.integer(str_extract(term, "-?\\d+"))) %>%
+  arrange(rel_time)
+
+ggplot(event_df, aes(x = rel_time, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  labs(
+    title = "Event-Study: Pre/Post Treatment Effects (controlling for spend)",
+    x = "Days Relative to Campaign",
+    y = "Estimated Effect on Sales"
+  ) +
+  theme_fancy()
+
+```
+
+For learning's sake here is what regression would look like
+
+```{r salesreg}
+pre_data <- teacher_signups %>%
+  mutate(
+    rel_time = as.integer(date - intervention_date),
+    log_teachers = log1p(num_teachers)
+  ) %>%
+  filter(rel_time < 0)
+
+pre_trend_test <- feols(
+  log_teachers ~ rel_time * treat | country_code,
+  data = pre_data,
+  cluster = ~ country_code
+)
+
+summary(pre_trend_test)
+
+```
+
+rel_time:treat1 = −0.000461 indicates that there is a difference in slopes between treated and control of ~0.11% decline per day for treated units (Treated countries’ pre-period slope is:−0.000639−0.000461=−0.00110). This difference is highly statistically significant.
+
+That's it! We have accounted for:
+
+* Equal variance in the pre-period.
+* Autocorrelation.
+* A consistent difference in the pre-period trend.
+* Determining if the difference is significant with either an Event Study or Linear Regression.
+
+Now instead of running this code over and over I have written a helper function that runs all these tests and returns the results.
+
+```{r diag, warning=FALSE}
+diag_results <- pre_treatment_diagnostics(
+  data = sales_data%>%
+    filter(post==0),
+  outcome = "sales",
+  treat = "treat",
+  time = "date",
+  post = "post",
+  intervention_date = intervention_date,  
+  do_event_study = TRUE                  
+)
+```
+
+
+This function returns a pre-period parallel trends plot
+```{r trendplot}
+diag_results$pre_trends_plot
+```
+
+and all other plots!
+```{r plots}
+# Plots returned by the pre-check function that are meaningful for panel DiD diagnostics
+diag_results$pre_trends_plot
+diag_results$slope_comparison_plot
+diag_results$event_study_plot
+```
+
+```{r slopes}
+summary(diag_results$slope_model)
+```

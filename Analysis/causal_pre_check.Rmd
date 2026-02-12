@@ -488,6 +488,9 @@ diag_results <- pre_treatment_diagnostics(
   intervention_date = intervention_date,  
   do_event_study = TRUE                  
 )
+
+diag_results$summary_table
+
 ```
 
 
