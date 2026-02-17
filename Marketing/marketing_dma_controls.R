@@ -31,12 +31,14 @@ city_summary<-df_sub%>%
             sd_subs=sd(upgrades),
             google_spend=sum(google_spend),
             meta_spend=sum(meta_spend))%>%
+  ungroup()%>%
+  rename(dma=city)%>%
   arrange(desc(users))%>%
   mutate(rank=row_number())
 
 pre_spend<-df%>%
   filter(date<="2025-08-01")%>%
-  group_by(city)%>%
+  group_by(dma)%>%
   mutate_if(is.integer, as.numeric)%>%
   summarize(users=sum(active_users),
             sub_ratio=(sum(upgrades)/sum(active_users))*100,
@@ -60,16 +62,16 @@ treatment_cities<-as.data.frame(c('charlotte',
   rename(treat=1)
 
 test<-df%>%
-  filter(city %in% treatment_cities$treat)
+  filter(dma %in% treatment_cities$treat)
 
 matching_df<-df%>%
-  mutate(treat=ifelse(city %in% treatment_cities$treat,1,0))
+  mutate(treat=ifelse(dma %in% treatment_cities$treat,1,0))
 
 synthetic_panel <- best_matches_all_cities(
   data           = matching_df,
   matching_metric = "upgrades",
   date_col        = "date",
-  city_col        = "city",
+  city_col        = "dma",
   treat_col       = "treat",
   match_window    = c("2024-01-01", "2025-08-01"),   # your pre-period
   matches_per_city     = 10,
@@ -83,7 +85,7 @@ synthetic_panel <- build_synthetic_control(
   data           = matching_df,
   matching_metric = "upgrades",
   date_col        = "date",
-  city_col        = "city",
+  city_col        = "dma",
   treat_col       = "treat",
   match_window    = c("2024-01-01", "2024-05-31"),
   n_matches       = 10,
