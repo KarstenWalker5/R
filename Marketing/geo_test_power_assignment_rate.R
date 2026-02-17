@@ -43,16 +43,17 @@ set.seed(123)
 
 ###### Power Analysis ######
 
+
 # Settings
-durations_weeks <- c(2, 3, 4, 6, 8)
+durations_weeks <- c(2, 3, 4, 6, 8,10)
 alpha <- 0.05
 target_power <- 0.80
 
 designs <- tibble::tribble(
   ~design, ~n_test, ~n_ctrl,
   "25/25", 25L,     25L,
-  "50/50", 50L,     50L,
-  "68/68", 68L,     68L
+  "52/52", 52L,     52L,
+  "63/63", 63L,     63L
 )
 
 top10_included_vals <- c(0L, 5L, 10L)
@@ -199,7 +200,7 @@ results_all_rate <- tidyr::crossing(
   select(top10_included, design, n_test, n_ctrl, K, power_tbl) %>%
   unnest(power_tbl) %>%
   mutate(
-    n_bau = 278 - K
+    n_bau = 210 - K
   ) %>%
   select(
     top10_included, design, K, n_test, n_ctrl, n_bau,
@@ -257,7 +258,7 @@ assign_test_control <- function(df, ranked_tbl, top10, top10_exclude_5,
 
 # Example: top10_included=0 and 50/50 design
 out <- assign_test_control(df2, ranked, top10, top10_exclude_5,
-                           top10_included = 0L, n_test = 50L, n_ctrl = 50L)
+                           top10_included = 0L, n_test = 52L, n_ctrl = 52L)
 
 # Final assignment table
 assignment_table<-out$assignment%>%
@@ -276,7 +277,7 @@ pre_start_date <- as.Date("2025-01-01")  # <-- change
 pre_end_date   <- as.Date("2025-01-28")  # <-- change
 
 #  Build DMA-level pre-period summary for treatment/control 
-balance_df <- df2 %>%
+balance_df_rate <- df2 %>%
   filter(date >= pre_start_date & date <= pre_end_date) %>%
   group_by(dma) %>%
   summarise(
@@ -292,7 +293,7 @@ balance_df <- df2 %>%
   filter(is.finite(pre_rate))
 
 #  Summary table (means/medians by group) 
-balance_summary <- balance_df %>%
+balance_summary_rate <- balance_df_rate %>%
   group_by(group) %>%
   summarise(
     n_dmas = n(),
@@ -305,7 +306,7 @@ balance_summary <- balance_df %>%
     .groups = "drop"
   )
 
-balance_summary
+balance_summary_rate
 
 # Treatment Vs. Control t-tests (pre-period balance checks) 
 tt_pre_rate <- t.test(pre_rate ~ treatment, data = balance_df)
@@ -340,4 +341,114 @@ balance_smd <- tibble(
 )
 
 balance_smd
+
+# Sample size needed for target MDE
+# sd_did: SD of the DMA-level DiD metric (rate diff or raw diff)
+# target_mde: effect you want to detect (same units as sd_did)
+# returns required n per arm (rounded up)
+# Safe helper that returns NA_integer_ on invalid inputs or errors
+n_needed_for_mde_safe <- function(sd_did, target_mde, target_power = 0.8, alpha = 0.05) {
+  # basic guards
+  if (!is.finite(sd_did) || sd_did <= 0) return(NA_integer_)
+  if (!is.finite(target_mde) || target_mde <= 0) return(NA_integer_)
+  # compute Cohen's d and call pwr; wrap in tryCatch to avoid hard errors
+  d <- target_mde / sd_did
+  out <- tryCatch({
+    n_per_group <- pwr.t.test(d = d, power = target_power, sig.level = alpha, type = "two.sample")$n
+    ceiling(n_per_group)
+  }, error = function(e) NA_integer_)
+  out
+}
+
+# Example target fraction of baseline you care about
+target_pct_drop <- 0.10   # 10%
+target_power <- 0.80
+alpha <- 0.05
+
+# Compute target_mde and required n per arm safely for every row in results_all_rate
+results_all_rate_nneeded <- results_all_rate %>%
+  mutate(
+    target_mde = target_pct_drop * avg_daily_rate,
+    n_per_arm_needed = purrr::pmap_int(
+      list(sd_did_rate, target_mde),
+      ~ n_needed_for_mde_safe(sd_did = ..1, target_mde = ..2,
+                              target_power = target_power, alpha = alpha)
+    ),
+    total_dmas_needed = ifelse(is.na(n_per_arm_needed), NA_integer_, 2L * n_per_arm_needed)
+  ) %>%
+  select(top10_included, design, weeks, sd_did_rate, avg_daily_rate, target_mde, n_per_arm_needed, total_dmas_needed)
+
+# Quick diagnostic to see which rows failed (if any)
+failed_rows_rate <- results_all_rate_nneeded %>% filter(is.na(n_per_arm_needed))
+if (nrow(failed_rows_rate) > 0) {
+  message("Some rows returned NA for required n. Typical causes: sd_did_rate is NA or nonpositive, or target_mde is NA/nonpositive.")
+  print(failed_rows_rate %>% select(top10_included, design, weeks, sd_did_rate, avg_daily_rate, target_mde))
+}
+
+# results_all_rate_nneeded is the output you can inspect or save
+results_all_rate_nneeded
+
+# Once you have total_dmas_needed, compare it to how many DMAs you’re willing to allocate:
+# * If you’re doing 68/68 = 136 DMAs
+# * If required total > 136, you either need:
+#   * longer duration (if SD drops with time)
+#   * better variance reduction (rate helps; maybe log-rate)
+#   * accept a larger detectable effect (bigger target_pct_drop)
+
+# Plots
+# PCT drop X duration
+common_baseline_rate <- results_all_rate %>%
+  filter(top10_included == 10, design == "63/63") %>%
+  summarise(b = mean(avg_daily_rate, na.rm = TRUE)) %>%
+  pull(b)
+
+plot_both_rate <- results_all_rate %>%
+  mutate(
+    pct_common = detectable_drop_rate_per_day / common_baseline_rate,
+    design = factor(design, levels = c("25/25","52/52","63/63")),
+    top10_included = factor(top10_included,
+                            levels = c(0,5,10),
+                            labels = c("0 of Top 10 Included",
+                                       "5 of Top 10 Included",
+                                       "10 of Top 10 Included"))
+  ) %>%
+  select(top10_included, design, weeks,
+         Absolute = detectable_drop_rate_per_day,
+         Percent = pct_common) %>%
+  pivot_longer(cols = c(Absolute, Percent),
+               names_to = "Metric",
+               values_to = "Value")
+
+ggplot(plot_both_rate,
+       aes(x = weeks,
+           y = Value,
+           color = design,
+           group = design)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2.5) +
+  facet_grid(Metric ~ top10_included, scales = "free_y") +
+  scale_y_continuous(
+    labels = function(x) {
+      if (max(x, na.rm = TRUE) < 1) {
+        percent(x)
+      } else {
+        round(x, 1)
+      }
+    }) +
+  labs(title = "Detectable Effect by Duration",
+       subtitle = "Rate-based KPI",
+       x = "Test Duration (Weeks)",
+       y = "",
+       color = "Design") +
+  theme_fancy() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+
+
+# Export Tables
+openxlsx::write.xlsx(list("Assignment Table, Rate KPI"=assignment_table_rate,
+                          "MDE Estimate Table, Rate KPI "=results_all_rate,
+                          "N Needed, Rate KPI"=results_all_rate_nneeded,
+                          "Balance Summary, Rate KPI"=balance_summary_rate),
+                     file = "/Users/karstenwalker/Documents/geo_test_estimates_rate.xlsx")
 

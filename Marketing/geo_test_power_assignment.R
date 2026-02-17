@@ -25,8 +25,12 @@ library(pwr)
 library(bigrquery)
 library(dplyr)
 library(lubridate)
+library(scales)
+library(ggplot2)
+library(scales)
+library(patchwork)
 
-###### Load data ######
+###### Load data and theme ######
 
 # Replace with your actual GCP Project ID
 project_id <- "compact-sylph-785" 
@@ -38,13 +42,24 @@ bq_data <- bq_project_query(project_id, sql)
 
 df <- bq_table_download(bq_data)
 
-
 set.seed(123)
+
+
+theme_fancy <- function() {
+  ggthemes::theme_fivethirtyeight() %+replace% 
+    theme(plot.title = element_text(hjust=0.5, size=20,face="bold"),
+          plot.subtitle = element_text(hjust=0.5, size=20, face="italic"),
+          legend.position = "bottom",
+          plot.background=element_rect(fill="white"),
+          panel.background=element_rect(fill="white"),
+          legend.background=element_rect(fill="white")
+    )
+}
 
 ###### Power Analysis ######
 
 # Settings
-durations_weeks <- c(2, 3, 4, 6, 8)
+durations_weeks <- c(2, 3, 4, 6, 8, 10)
 alpha <- 0.05
 target_power <- 0.80
 
@@ -52,8 +67,8 @@ target_power <- 0.80
 designs <- tibble::tribble(
   ~design, ~n_test, ~n_ctrl,
   "25/25", 25L,     25L,
-  "50/50", 50L,     50L,
-  "68/68", 68L,     68L
+  "52/52", 52L,     52L,
+  "63/63", 63L,     63L
 )
 
 # Number of top-10 DMAs INCLUDED in eligibility (others forced BAU)
@@ -186,7 +201,7 @@ results_all <- tidyr::crossing(
   unnest(power_tbl) %>%
   mutate(
     # BAU are all remaining DMAs out of full universe 278
-    n_bau = 278 - K
+    n_bau = 210 - K
   ) %>%
   select(
     top10_included, design, K, n_test, n_ctrl, n_bau,
@@ -199,6 +214,7 @@ results_all
 
 # Sanity check which DMAs are in the eligible pool for a scenario
 # Example: top10_included=0, design=50/50 => K=100 => should correspond to ranks 11–110
+
 elig_example <- get_eligible_nextK(df2, 
                                    ranked, 
                                    top10, 
@@ -211,7 +227,8 @@ ranked %>%
   arrange(rank) %>% 
   slice(1:50)
 
-###### Test/Control random assignment ######
+###### Now identify which go into test/control ######
+
 assign_test_control <- function(df, ranked_tbl, top10, top10_exclude_5,
                                 top10_included, n_test, n_ctrl) {
   K <- n_test + n_ctrl
@@ -242,7 +259,7 @@ assign_test_control <- function(df, ranked_tbl, top10, top10_exclude_5,
 
 # Example: top10_included=0 and 50/50 design
 out <- assign_test_control(df2, ranked, top10, top10_exclude_5,
-                           top10_included = 0L, n_test = 50L, n_ctrl = 50L)
+                           top10_included = 0L, n_test = 52L, n_ctrl = 52L)
 
 # Final assignment table
 assignment_table<-out$assignment%>%
@@ -254,7 +271,7 @@ assignment_table<-out$assignment%>%
 # 7) Balance report
 # Requires: df2 (dma,date,upgrades,active_users), assignment (dma,group)
 
-#  pre-perod window
+#  pre-period window
 pre_start_date <- as.Date("2025-01-01")  # <-- change
 
 pre_end_date   <- as.Date("2025-01-28")  # <-- change
@@ -329,57 +346,48 @@ balance_smd
 # sd_did: SD of the DMA-level DiD metric (rate diff or raw diff)
 # target_mde: effect you want to detect (same units as sd_did)
 # returns required n per arm (rounded up)
-n_needed_for_mde <- function(sd_did, target_mde, target_power = 0.8, alpha = 0.05) {
+# Safe helper that returns NA_integer_ on invalid inputs or errors
+n_needed_for_mde_safe <- function(sd_did, target_mde, target_power = 0.8, alpha = 0.05) {
+  # basic guards
+  if (!is.finite(sd_did) || sd_did <= 0) return(NA_integer_)
+  if (!is.finite(target_mde) || target_mde <= 0) return(NA_integer_)
+  # compute Cohen's d and call pwr; wrap in tryCatch to avoid hard errors
   d <- target_mde / sd_did
-  ceiling(pwr.t.test(d = d, power = target_power, sig.level = alpha, type = "two.sample")$n)
+  out <- tryCatch({
+    n_per_group <- pwr.t.test(d = d, power = target_power, sig.level = alpha, type = "two.sample")$n
+    ceiling(n_per_group)
+  }, error = function(e) NA_integer_)
+  out
 }
 
-# Example: want to detect a 10% drop in rate
-# Convert desired % drop into absolute MDE in rate units:
-target_pct_drop <- 0.10
+# Example target fraction of baseline you care about
+target_pct_drop <- 0.10   # 10%
+target_power <- 0.80
+alpha <- 0.05
 
-target_mde_rate <- target_pct_drop * avg_daily_rate  # avg_daily_rate from  run_power_table()
+# Compute target_mde and required n per arm safely for every row in results_all
+results_all_nneeded <- results_all %>%
+  mutate(
+    target_mde = target_pct_drop * avg_daily_upgrades,
+    n_per_arm_needed = purrr::pmap_int(
+      list(sd_did, target_mde),
+      ~ n_needed_for_mde_safe(sd_did = ..1, target_mde = ..2,
+                              target_power = target_power, alpha = alpha)
+    ),
+    total_dmas_needed = ifelse(is.na(n_per_arm_needed), NA_integer_, 2L * n_per_arm_needed)
+  ) %>%
+  select(top10_included, design, weeks, sd_did, avg_daily_upgrades, target_mde, n_per_arm_needed, total_dmas_needed)
 
-n_needed_for_mde(sd_did = sd_did_rate, target_mde = target_mde_rate, target_power = 0.8, alpha = 0.05)
-
-# Required N per arm vs weeks table: how many DMAs per arm are needed for a given target % drop.
-
-required_n_table <- function(df_eligible, durations_weeks, target_pct_drop,
-                             target_power = 0.8, alpha = 0.05) {
-  
-  # baseline avg daily rate in eligible pool (same as in your power table)
-  avg_daily_rate <- df_eligible %>%
-    group_by(dma) %>%
-    summarise(
-      sum_up = sum(upgrades, na.rm = TRUE),
-      sum_au = sum(active_users, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    mutate(rate = ifelse(sum_au > 0, sum_up / sum_au, NA_real_)) %>%
-    summarise(avg_rate = mean(rate, na.rm = TRUE)) %>%
-    pull(avg_rate)
-  
-  map_dfr(durations_weeks, function(T) {
-    sd_did <- estimate_sd_did(df_eligible, T)   # your rate-based estimate_sd_did()
-    target_mde <- target_pct_drop * avg_daily_rate
-    n_per_arm <- n_needed_for_mde(sd_did, target_mde, target_power, alpha)
-    
-    tibble(
-      weeks = T,
-      sd_did_rate = sd_did,
-      avg_daily_rate = avg_daily_rate,
-      target_pct_drop = target_pct_drop,
-      target_mde_rate = target_mde,
-      n_per_arm_needed = n_per_arm,
-      total_dmas_needed = 2 * n_per_arm
-    )
-  })
+# Quick diagnostic to see which rows failed (if any)
+failed_rows <- results_all_nneeded %>% filter(is.na(n_per_arm_needed))
+if (nrow(failed_rows) > 0) {
+  message("Some rows returned NA for required n. Typical causes: sd_did is NA or nonpositive, or target_mde is NA/nonpositive.")
+  print(failed_rows %>% select(top10_included, design, weeks, sd_did, avg_daily_upgrades, target_mde))
 }
 
-# Suppose elig is the eligible pool for the scenario you care about
-# (e.g., top10_included=0 and K = 136, or you can use all eligible DMAs)
-req_tbl_10pct <- required_n_table(elig, durations_weeks, target_pct_drop = 0.10)
-req_tbl_10pct
+# results_all_nneeded is the output you can inspect or save
+results_all_nneeded
+
 
 # Once you have total_dmas_needed, compare it to how many DMAs you’re willing to allocate:
 # * If you’re doing 68/68 = 136 DMAs
@@ -387,3 +395,74 @@ req_tbl_10pct
 #   * longer duration (if SD drops with time)
 #   * better variance reduction (rate helps; maybe log-rate)
 #   * accept a larger detectable effect (bigger target_pct_drop)
+
+# Plots
+# PCT drop X duration
+# Ensure design factor levels match current scripts
+design_levels <- c("25/25", "52/52", "63/63")
+top10_labels <- c("0 of Top 10 Included", "5 of Top 10 Included", "10 of Top 10 Included")
+
+# Common baseline for normalized percent
+common_baseline <- results_all %>%
+  filter(top10_included == 10, design == "63/63") %>%
+  summarise(b = mean(avg_daily_upgrades, na.rm = TRUE)) %>%
+  pull(b)
+
+plot_both <- results_all %>%
+  mutate(
+    pct_common = detectable_drop_upgrades_per_day / common_baseline,
+    design = factor(design, levels = c("25/25","52/52","63/63")),
+    top10_included = factor(top10_included,
+                            levels = c(0,5,10),
+                            labels = c("0 of Top 10 Included",
+                                       "5 of Top 10 Included",
+                                       "10 of Top 10 Included"))
+  ) %>%
+  select(top10_included, design, weeks,
+         Absolute = detectable_drop_upgrades_per_day,
+         Percent = pct_common) %>%
+  pivot_longer(cols = c(Absolute, Percent),
+               names_to = "Metric",
+               values_to = "Value")
+
+ggplot(plot_both,
+       aes(x = weeks,
+           y = Value,
+           color = design,
+           group = design)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2.5) +
+  facet_grid(Metric ~ top10_included, scales = "free_y") +
+  scale_y_continuous(
+    labels = function(x) {
+      if (max(x, na.rm = TRUE) < 1) {
+        percent(x)
+      } else {
+        round(x, 1)
+      }
+    }) +
+  labs(title = "Detectable Effect by Duration",
+       x = "Test Duration (Weeks)",
+       y = "",
+       color = "Design") +
+  theme_fancy() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+
+# Export Tables
+openxlsx::write.xlsx(list("Assignment Table"=assignment_table,
+                          "MDE Estimate Table"=results_all,
+                          "N Needed"=results_all_nneeded,
+                          "Balance Summary"=balance_summary),
+                     file = "/Users/karstenwalker/Documents/geo_test_estimates.xlsx")
+
+# All on 1 sheet, requires running geo_test_power_assignment_rate.R
+openxlsx::write.xlsx(list("Assignment Table"=assignment_table,
+                          "Assignment Table, Rate KPI"=assignment_table_rate,
+                          "MDE Estimate Table"=results_all,
+                          "MDE Estimate Table, Rate KPI "=results_all_rate,
+                          "N Needed"=results_all_nneeded,
+                          "N Needed, Rate KPI"=results_all_rate_nneeded,
+                          "Balance Summary"=balance_summary,
+                          "Balance Summary, Rate KPI"=balance_summary_rate),
+                     file = "/Users/karstenwalker/Documents/geo_test_estimates_all.xlsx")
