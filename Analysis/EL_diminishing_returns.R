@@ -30,7 +30,7 @@ library(scales)
 
 plot_diminishing_returns_multi <- function(df,
                                            total_col = flashcards_questions_answered,
-                                           retention_cols = c("7d_retained", "28d_retained", "90d_retained"),
+                                           retention_cols = c("retained7d", "retained28d", "retained90d"),
                                            n_bins = 50,
                                            min_bin_n = 20,
                                            max_total = NULL,
@@ -194,15 +194,17 @@ plot_diminishing_returns_multi <- function(df,
 }
 
 # Example:
-plot_diminishing_returns_multi(el_data%>%filter(flashcards_questions_answered>0))                           # default: 90% of max
-plot_diminishing_returns_multi(el_data, pct = 0.80)               # stricter plateau
-plot_diminishing_returns_multi(el_data, method="marginal",marginal_pp = 0.0005)             # 0.05pp per action
+plot_diminishing_returns_multi(el_data%>%filter(flashcards_questions_answered>0))   
+# default: 90% of max
+plot_diminishing_returns_multi(el_data%>%filter(flashcards_questions_answered>0), pct = 0.80)  
+# stricter plateau
+plot_diminishing_returns_multi(el_data%>%filter(flashcards_questions_answered>0), method="marginal",marginal_pp = 0.0005)             # 0.05pp per action
 
 # Plot diminshing returns inflection to find 
 
 plot_diminishing_returns_inflection <- function(df,
                                                 total_col = flashcards_questions_answered,
-                                                retention_cols = c("7d_retained", "28d_retained", "90d_retained"),
+                                                retention_cols = c("retained7d", "retained28d", "retained90d"),
                                                 n_bins = 50,
                                                 min_bin_n = 20,
                                                 max_total = NULL,
@@ -341,7 +343,7 @@ plot_diminishing_returns_inflection(el_data%>%filter(flashcards_questions_answer
 # Use it when you want an activation KPI (“good enough engagement”) rather than a near-maximum benchmark.
 plot_diminishing_returns_inflection <- function(df,
                                                 total_col = flashcards_questions_answered,
-                                                retention_cols = c("7d_retained", "28d_retained", "90d_retained"),
+                                                retention_cols = c("retained7d", "retained28d", "retained90d"),
                                                 n_bins = 50,
                                                 min_bin_n = 20,
                                                 max_total = NULL,
