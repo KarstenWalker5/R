@@ -559,7 +559,6 @@ cluster_runs <- replicate(5, {
 mclust::adjustedRandIndex(cluster_runs[[1]], cluster_runs[[2]])
 
 # Val of 1 means extremely stable clusters across iteratons using different seeds
-
 # How often do users move between clusters
 df_full_with_clusters %>%
   arrange(user_id, week) %>%
