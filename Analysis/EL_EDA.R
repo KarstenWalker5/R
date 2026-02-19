@@ -7,6 +7,10 @@ library(bigrquery)
 library(tidyverse)
 library(irlba)
 library(ClusterR)
+library(openxlsx)
+library(stringr)
+library(purrr)
+library(broom)
 
 # Store your Google Cloud project ID
 bq_auth()
@@ -333,7 +337,7 @@ overall <- df_full_with_clusters %>%
     r90 = mean(retained90d, na.rm = TRUE)
   )
 
-df_full_with_clusters %>%
+lift_by_cluster<-df_full_with_clusters %>%
   group_by(cluster) %>%
   summarise(
     n = n(),
@@ -360,7 +364,7 @@ plot_df <- data.frame(
 )
 
 # Sample for plotting 
-plot_n <- min(nrow(plot_df), 100000)
+plot_n <- min(nrow(plot_df), 200000)
 
 plot_df_s <- plot_df%>%
   slice_sample(n = plot_n)
@@ -439,7 +443,6 @@ df_full_with_clusters2 %>%
     lift90 = r90 / overall$r90
   ) %>%
   arrange(desc(lift7))
-
 
 ### Computer cluster stats
 
@@ -557,8 +560,8 @@ cluster_runs <- replicate(5, {
 }, simplify = FALSE)
 
 mclust::adjustedRandIndex(cluster_runs[[1]], cluster_runs[[2]])
-
 # Val of 1 means extremely stable clusters across iteratons using different seeds
+
 # How often do users move between clusters
 df_full_with_clusters %>%
   arrange(user_id, week) %>%
@@ -589,6 +592,7 @@ transition_matrix <- transitions %>%
   )
 
 transition_matrix
+
 # Big flows that look like a ladder:
 # 1 > 6 is huge (0.382)
 # 6 > 1 is also sizable (0.205)
@@ -621,12 +625,14 @@ summary(user_cluster_span$n_clusters_visited)
 table(user_cluster_span$n_clusters_visited)
 
 # 58.6% in 1 cluster, 26.7% in 2
-user_cluster_span %>%
+pct_visited<-user_cluster_span %>%
   count(n_clusters_visited) %>%
   mutate(
     pct_users = 100 * n / sum(n)
   ) %>%
   arrange(n_clusters_visited)
+
+pct_visited
 
 # Movement rate
 # < 20% → mostly stable types
@@ -700,7 +706,7 @@ state_vs_ret<-df_states %>%
   arrange(desc(n))
 
 # Simple regression of current cluster vs prev
-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + changed_cluster,
+cluster_move_glm1<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + changed_cluster,
     data = df_states,
     family = binomial)
 
@@ -725,7 +731,7 @@ df_states <- df_states %>%
     )
   )
 
-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + factor(direction),
+cluster_direction_glm<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + factor(direction),
     data = df_states,
     family = binomial)
 
@@ -812,10 +818,10 @@ df_runs <- df_states %>%
 
 ### Cluster drivers
 # Compare
-# * 4 vs 8 (retention high/low respectively)
+# * 4 vs 6 (retention high/low respectively)
 # * 4 vs 3 (both high retention)
-# * 3 vs 8 (similar retention, different paid)
-# * 2 vs 7 (middle clusters)
+# * 3 vs 6 (similar retention, different paid)
+# * 2 vs 4 (middle clusters)
 # * 1 vs 2 (lower-mid retention)
 
 cluster_drivers <- cluster_summary_tidy %>%
@@ -851,12 +857,304 @@ contrast_clusters <- function(df, c1, c2, top_n = 15) {
 # Check contrasts
 contrast_4_6<- contrast_clusters(cluster_summary_tidy, 4, 6)
 
-contrast_4_3<- contrast_clusters(cluster_summary_tidy, 4, 3)
+contrast_4_3<-contrast_clusters(cluster_summary_tidy, 4, 3)
 
 contrast_2_5<-contrast_clusters(cluster_summary_tidy, 2, 5)
 
 contrast_2_6<-contrast_clusters(cluster_summary_tidy, 2, 6)
 
+# Compare highest retention clusters
+high <- c(4, 3, 1)
+
+wide_high <- cluster_summary_tidy %>%
+  filter(cluster %in% high) %>%
+  select(cluster, metric, pct_lift_vs_global) %>%
+  pivot_wider(names_from = cluster, values_from = pct_lift_vs_global)
+
+# Top 3 retention cluster diffs
+high_archetype_1 <- wide_high %>%
+  mutate(d43 = `4` - `3`, d31 = `3` - `1`) %>%
+  filter(d43 > 0, d31 > 0) %>%
+  arrange(desc(d43 + d31)) %>%
+  slice_head(n = 20)
+
+# Now 4 to 1 contrast
+high_archetype_2 <- wide_high %>%
+  mutate(d14 = `1` - `4`, d43 = `4` - `3`) %>%
+  filter(d14 > 0, d43 > 0) %>%
+  arrange(desc(d14 + d43)) %>%
+  slice_head(n = 20)
+
+high_archetype_1
+
+high_archetype_2
+
+# Composite score of metric "styles"
+# Need to add more items to the list
+axis_defs <- list(
+  creation = c("sets_created", "manual_sets_created", "class_creation", "folders_created", "items_added_to_folder"),
+  consumption = c("questions_viewed", "flashcards_questions_answered", "minutes_active"),
+  expert_solutions = c("expert_solutions"),
+  organization = c("folders_", "items_added_to_folder", "organize|organization")
+)
+
+# Build axis scores using available columns (works with *_log too)
+add_axis_scores <- function(df, axis_defs) {
+  feature_cols <- get_feature_cols(df)
+  for (ax in names(axis_defs)) {
+    pats <- axis_defs[[ax]]
+    cols <- feature_cols[reduce(pats, ~ .x | str_detect(feature_cols, .y), .init = FALSE)]
+    if (length(cols) == 0) next
+    df <- df %>%
+      mutate(!!paste0("axis_", ax) := rowSums(across(all_of(cols), ~ replace_na(.x, 0)), na.rm = TRUE))
+  }
+  df
+}
+
+df_with_axes <- add_axis_scores(df_full_with_clusters, axis_defs)
+
+axis_profile <- df_with_axes %>%
+  group_by(cluster) %>%
+  summarise(across(starts_with("axis_"), ~ mean(.x, na.rm = TRUE)),
+            n = n(),
+            r7 = mean(retained7d, na.rm = TRUE),
+            .groups = "drop")
+
+axis_profile
+
+# Identify retention-neutral clusters w/ similar retention, diff behavior
+# Find similar r7, show top diffs
+ret_by_cluster <- df_full_with_clusters %>%
+  group_by(cluster) %>%
+  summarise(r7 = mean(retained7d, na.rm = TRUE), n = n(), .groups = "drop")
+
+# Pick pairs within +/- 0.01 retention
+tol <- 0.01
+pairs <- tidyr::crossing(c1 = ret_by_cluster$cluster, c2 = ret_by_cluster$cluster) %>%
+  filter(c1 < c2) %>%
+  left_join(ret_by_cluster, by = c("c1" = "cluster")) %>%
+  rename(r7_1 = r7, n1 = n) %>%
+  left_join(ret_by_cluster, by = c("c2" = "cluster")) %>%
+  rename(r7_2 = r7, n2 = n) %>%
+  mutate(diff_r7 = abs(r7_1 - r7_2)) %>%
+  filter(diff_r7 <= tol) %>%
+  arrange(diff_r7)
+
+pairs %>% slice_head(n = 10)
+
+# Show contrasts for the best pair (if any)
+best_pair_contrasts<-if (nrow(pairs) > 0) {
+  best <- pairs[1, ]
+  contrast_clusters(cluster_summary_tidy, best$c1, best$c2, top_n = 20)
+}
+
+# Behavioral diversity: feature breadth + entropy
+# Breadth = # of features used/on-zero in a week.
+
+feature_cols <- get_feature_cols(df_full_with_clusters)
+
+df_div <- df_full_with_clusters %>%
+  mutate(
+    feature_breadth = rowSums(across(all_of(feature_cols), ~ as.integer(replace_na(.x, 0) > 0)))
+  )
+
+breadth_by_cluster <- df_div %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    mean_breadth = mean(feature_breadth, na.rm = TRUE),
+    r7 = mean(retained7d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_breadth))
+
+breadth_by_cluster
+
+# Entropy
+# identify feature columns automatically
+feature_cols <- df_full_with_clusters %>%
+  select(-user_id, -week, -cluster) %>%
+  select(where(is.numeric)) %>%
+  select(-starts_with("retained")) %>%
+  colnames()
+
+# select count vars only
+count_like <- feature_cols[
+  str_detect(feature_cols, 
+             "count|minutes|questions|views|clicks|created|added|reveals")
+]
+
+# eEntropy func
+entropy_row <- function(x) {
+  x <- pmax(x, 0)
+  s <- sum(x)
+  if (s == 0) return(NA_real_)
+  p <- x / s
+  -sum(p[p > 0] * log(p[p > 0]))
+}
+
+# compute entropy per user-week
+df_entropy <- df_full_with_clusters %>%
+  mutate(
+    entropy_usage = apply(
+      select(., all_of(count_like)) %>%
+        mutate(across(everything(), ~ replace_na(.x, 0))) %>%
+        as.matrix(),
+      1,
+      entropy_row
+    )
+  )
+
+# compare by cluster
+entropy_compare<-df_entropy %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    mean_entropy = mean(entropy_usage, na.rm = TRUE),
+    r7 = mean(retained7d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_entropy))
+
+# Cluster output table
+cluster_fact_sheet <- df_full_with_clusters %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    r7 = mean(retained7d, na.rm = TRUE),
+    r28 = mean(retained28d, na.rm = TRUE),
+    r90 = mean(retained90d, na.rm = TRUE),
+    pct_paid_any = mean(account_type %in% c("Plus", "PaidTeacher"), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(r7))
+
+# Attach top drivers (by abs lift vs global) as a readable string per cluster
+drivers_table <- cluster_summary_tidy %>%
+  filter(!is.na(pct_lift_vs_global)) %>%
+  group_by(cluster) %>%
+  slice_max(abs(pct_lift_vs_global), n = 6) %>%
+  summarise(
+    top_drivers = paste0(
+      str_replace(metric, "^mean_", ""),
+      " (", sprintf("%+.0f%%", pct_lift_vs_global), ")",
+      collapse = "; "
+    ),
+    .groups = "drop"
+  )
+
+summary_table <- cluster_fact_sheet %>%
+  left_join(drivers_table, by = "cluster")
+
+summary_table
+
+# Write workbook of all tables
+# cluster_fact_sheet, drivers_table, summary_table, cluster_summary_tidy, retention_by_cluster, lift_by_cluster, global_means, cluster_means, cluster_profile, axis_profile,
+# transition_matrix, stability, pct_visited, state_ret, transition_ret, cluster_drivers, comparison, best_pair_contrasts,
+# contrast_4_6, contrast_4_3, contrast_2_5, contrast_2_6, wide_high, high_archetype_1, high_archetype_2, breadth_by_cluster,
+# entropy_compare
+
+# Helper to make unique Excel-safe sheet names
+make_unique_sheet_names <- function(names_in) {
+  out <- character(length(names_in))
+  used <- character(0)
+  
+  for (i in seq_along(names_in)) {
+    base <- str_trim(names_in[i])
+    base <- str_replace_all(base, "[:\\\\/?*\\[\\]]", " ")
+    base <- str_replace_all(base, "\\s+", " ")
+    base <- substr(base, 1, 31)
+    
+    candidate <- base
+    j <- 1
+    
+    while (tolower(candidate) %in% tolower(used) || candidate == "") {
+      suffix <- paste0(" ", j)
+      candidate <- substr(base, 1, 31 - nchar(suffix))
+      candidate <- paste0(candidate, suffix)
+      j <- j + 1
+    }
+    
+    out[i] <- candidate
+    used <- c(used, candidate)
+  }
+  
+  out
+}
+
+wb <- createWorkbook()
+
+table_names <- c(
+  "cluster_fact_sheet", "drivers_table", "summary_table", "cluster_summary_tidy",
+  "retention_by_cluster", "lift_by_cluster", "global_means", "cluster_means",
+  "cluster_profile", "axis_profile", "transition_matrix", "stability", "pct_visited",
+  "state_ret", "transition_ret", "cluster_drivers", "comparison", "best_pair_contrasts",
+  "contrast_4_6", "contrast_4_3", "contrast_2_5", "contrast_2_6", "wide_high",
+  "high_archetype_1", "high_archetype_2", "breadth_by_cluster", "entropy_compare"
+)
+
+models <- list(
+  "GLM Cluster Only" = model_cluster_only,
+  "GLM Cluster + Prev + Changed" = cluster_move_glm1,
+  "GLM Cluster + Prev + Direction" = cluster_direction_glm
+)
+
+model_tables <- purrr::imap(models, ~ glm_export_bundle_fast(.x))
+
+tbl_sheet_names <- table_names %>%
+  str_replace_all("_", " ") %>%
+  str_to_title()
+
+tbl_sheet_names <- make_unique_sheet_names(tbl_sheet_names)
+
+for (i in seq_along(table_names)) {
+  tbl_name <- table_names[i]
+  sheet_name <- tbl_sheet_names[i]
+  
+  if (exists(tbl_name)) {
+    tbl <- get(tbl_name)
+    
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet = sheet_name, x = tbl)
+    freezePane(wb, sheet = sheet_name, firstRow = TRUE)
+  } else {
+    message(paste("Skipping:", tbl_name, "- object not found"))
+  }
+}
+
+model_sheets <- list()
+
+for (model_name in names(model_tables)) {
+  bundle <- model_tables[[model_name]]
+  
+  for (part in names(bundle)) {
+    df_out <- bundle[[part]]
+    
+    proposed <- paste(model_name, "-", str_to_title(part)) %>%
+      str_replace_all("_", " ") %>%
+      str_replace_all("\\s+", " ") %>%
+      str_trim()
+    
+    model_sheets[[proposed]] <- df_out
+  }
+}
+
+model_sheet_names_unique <- make_unique_sheet_names(names(model_sheets))
+
+for (i in seq_along(model_sheets)) {
+  sheet_name <- model_sheet_names_unique[i]
+  df_out <- model_sheets[[i]]
+  
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet = sheet_name, x = df_out)
+  setColWidths(wb, sheet = sheet_name, cols = 1:max(1, ncol(as.data.frame(df_out))), widths = "auto")
+  freezePane(wb, sheet = sheet_name, firstRow = TRUE)
+}
+
+# save workbook
+saveWorkbook(wb, "/Users/karstenwalker/Documents/Cluster_Analysis_V1.xlsx", overwrite = TRUE)
+
+### Next Steps
 # Remove pure volume metrics temporarily
 # Exclude features like sessions, questions_answered, minutes_active, and lifetime_sets_created
 # look at contrasts again.

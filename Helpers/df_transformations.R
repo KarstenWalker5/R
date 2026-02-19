@@ -78,3 +78,13 @@ add_ecdf_columns <- function(df, cols) {
     ))
 }
 
+###### Identify feature columns ######
+get_feature_cols <- function(df,
+                             id_cols = c("user_id", "week"),
+                             cluster_col = "cluster",
+                             retention_regex = "^retained") {
+  setdiff(
+    names(df),
+    c(id_cols, cluster_col, names(df)[str_detect(names(df), retention_regex)])
+  )
+}
