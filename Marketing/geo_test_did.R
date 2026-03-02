@@ -53,6 +53,8 @@ sql <- "SELECT *
 # Run the query
 tb <- bq_project_query(project_id, sql)
 
+geo_test_data<- bq_table_download(tb)
+
 # Build DMA level dataset
 
 analysis_df <- df2 %>%

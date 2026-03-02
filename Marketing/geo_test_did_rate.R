@@ -41,6 +41,7 @@ sql <- "SELECT *
 # Run the query
 tb <- bq_project_query(project_id, sql)
 
+geo_test_data<- bq_table_download(tb)
 
 # 1) Build DMA-level pre/post aggregates
 
