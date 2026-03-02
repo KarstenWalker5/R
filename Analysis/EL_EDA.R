@@ -11,6 +11,7 @@ library(openxlsx)
 library(stringr)
 library(purrr)
 library(broom)
+library(corrr)
 
 # Store your Google Cloud project ID
 bq_auth()
@@ -19,7 +20,7 @@ project_id <- "compact-sylph-785"
 
 # Define your SQL query (example using a public dataset)
 sql <- "SELECT * 
-        FROM `compact-sylph-785.Karsten.EL_1pct_1yr_LI_wk`"
+        FROM `compact-sylph-785.Karsten.EL_1pct_1yr_LI_dev_wk`"
 
 # Run the query
 tb <- bq_project_query(project_id, sql)
@@ -117,7 +118,7 @@ el_logged <- log_transform_skewed(el_data%>%
   
 ### Correlations
 cor_matrix <- el_data %>%
-  filter(flashcards_questions_answered_log>0)%>%
+  filter(flashcards_questions_answered>0)%>%
   select(-user_id, -uid, -country_code, -contains("date"))%>%
   correlate(use = "complete.obs", method = "pearson")
 
@@ -127,6 +128,7 @@ cor_matrix_spear <- el_data %>%
   correlate(use = "complete.obs", method = "spearman")
 
 cor_log<-el_logged%>%
+  filter(flashcards_questions_answered_log>0)%>%
   select(-user_id, -uid, -country_code, -contains("date"))%>%
   correlate(use = "complete.obs", method = "pearson")
 
@@ -272,7 +274,7 @@ elbow_df <- elbow_df %>%
     pct_improvement = delta / wss
   )
 
-# After 6 marginal gains stabilizes at <3%, noise coming to the far right, 6-8 is prob the sweet spot
+# After 6 marginal gains stabilizes at <3%, noise coming to the far right, 5-6 is prob the sweet spot
 
 ### Clustering on PCs
 k_final <- 6
@@ -280,7 +282,7 @@ k_final <- 6
 mbk <- ClusterR::MiniBatchKmeans(
   data = X_pcs_full,
   clusters = k_final,
-  batch_size = 20000,   # 10k–50k typical; increase for stability
+  batch_size = 30000,   # 10k–50k typical; increase for stability
   num_init = 5,         # increase for stability, decrease for speed
   max_iters = 100,
   init_fraction = 1.0,
@@ -330,6 +332,7 @@ df_full_with_clusters %>%
 retention_by_cluster
 
 # Lift by cluster
+# Calculates the % vs average for the cluster for retention
 overall <- df_full_with_clusters %>%
   summarise(
     r7  = mean(retained7d,  na.rm = TRUE),
@@ -378,11 +381,28 @@ ggplot(plot_df_s, aes(PC1, PC2, color = cluster)) +
     color = "Cluster"
   )
 
+# Adds elipses
+ggplot(plot_df_s, aes(PC1, PC2, color = cluster)) +
+  geom_point(alpha = 0.35, size = 0.7) +
+  stat_ellipse(aes(fill = cluster),
+               geom = "polygon",
+               type = "norm",
+               level = 0.90,      # ~covers 90% if roughly elliptical/normal
+               alpha = 0.15,
+               linewidth = 0.6,
+               show.legend = FALSE) +
+  theme_fancy() +
+  labs(
+    title = "Clusters, PC1 vs. PC2",
+    subtitle = paste0("Sample n=", plot_n),
+    color = "Cluster"
+  )
+
 ### Try without PCA 
 mbk2 <- ClusterR::MiniBatchKmeans(
   data = X_scaled,
   clusters = k_final,
-  batch_size = 20000,
+  batch_size = 30000,
   num_init = 5,
   max_iters = 100,
   init_fraction = 1.0,
@@ -594,15 +614,16 @@ transition_matrix <- transitions %>%
 transition_matrix
 
 # Big flows that look like a ladder:
-# 1 > 6 is huge (0.382)
-# 6 > 1 is also sizable (0.205)
-# 2 <> 5 <> 6 seems meaningful
+# 4 > 1 is huge (.459), 5 > 1 also large (.295)
+# 6 seems like a transition cluster, > 1 (.295), > 2 (.248), >3 (.254)
+# Clusters with least transitions: 1, 2, 5
 # Might imply that this is state/engagement based, not a unique entity.
 
 # Stability score per cluster
 # Stay prob > 0.7 → cluster behaves like a type
 # Stay prob 0.4–0.7 → semi-stable
 # Stay prob < 0.4 → cluster is a state
+# Cluster 1 and 5 are > .7, 3 is semi-stable, rest are stat4s
 
 stability <- transitions %>%
   filter(cluster == next_cluster) %>%
@@ -612,6 +633,8 @@ stability <- transitions %>%
 stability
 
 # How many unique clusters each user occupies across all weeks
+
+
 user_cluster_span <- df_full_with_clusters %>%
   group_by(user_id) %>%
   summarise(
@@ -619,12 +642,11 @@ user_cluster_span <- df_full_with_clusters %>%
     .groups = "drop"
   )
 
-summary(user_cluster_span$n_clusters_visited)
-
 # table
 table(user_cluster_span$n_clusters_visited)
 
-# 58.6% in 1 cluster, 26.7% in 2
+# 70.7% in 1 cluster, 24.5% in 2
+# At some point most users had not activated
 pct_visited<-user_cluster_span %>%
   count(n_clusters_visited) %>%
   mutate(
@@ -638,7 +660,7 @@ pct_visited
 # < 20% → mostly stable types
 # 20–40% → moderate state behavior
 # 50% → highly dynamic states
-# 46.3%
+# 28.7%
 
 movement_rate <- transitions %>%
   summarise(
@@ -664,7 +686,7 @@ ggplot(transitions, aes(x = factor(cluster),
   theme_minimal()
 
 # Probability a user leaves a cluster
-# 43%
+# 29.2%
 initial_cluster <- df_full_with_clusters %>%
   arrange(user_id, week) %>%
   group_by(user_id) %>%
@@ -689,8 +711,9 @@ df_states <- df_full_with_clusters %>%
   ungroup()
 
 # State vs. retention
-# Cluster 6 is danger zone, 4 is peak retained
-# Moving from 6 to 1 nearly doubles retention
+# Staying in cluster 3 93.7% retention
+# 1 > 3 is 89.8%
+# Staying in 1 is the worst outcome, but  3 >1 only has 65.8% retentin
 # 6 to 4 puts you into top tier retention.
 # 1 to 6 cuts retention dramatically.
 # 4 or 5 to 6 is catastrophic.
@@ -705,20 +728,23 @@ state_vs_ret<-df_states %>%
   ) %>%
   arrange(desc(n))
 
+print(state_vs_ret%>%
+        arrange(desc(r7)), n=50)
+
 # Simple regression of current cluster vs prev
 cluster_move_glm1<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + changed_cluster,
     data = df_states,
     family = binomial)
 
-# 15% of deviance explained by just state + previous state + change indicator.
-# baseline is cluster 1 since ommitted
-# Even after controlling for current cluster, previous cluster still matters.
-# Coefs
-#   2	-0.395	lower retention
-#   3	+0.270	higher
-#   4	+0.510	much higher
-#   5	-0.226	slightly lower
-#   6	-1.958	dramatically lower
+summary(cluster_move_glm1)
+
+# Intercept: baseline retention ~60%
+# Current cluster
+# * Cluster 3 has dramatically higher retention than cluster 1. Clusters 4 and 6 are also very strong.
+# * Suggests clusters meaningfully separate users by engagement/quality.
+# Previous cluster
+# Past cluster has some predictive value, but much weaker than current cluster. Being in cluster 3 previously still improves retention odds.
+# Summary: Retention is driven mostly by current state, not historical state.
 
 # Replace changed_cluster with directional movement
 df_states <- df_states %>%
@@ -735,14 +761,65 @@ cluster_direction_glm<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) +
     data = df_states,
     family = binomial)
 
-# plogis(2.0492) ≈ 0.886
-# Users who moved down into cluster 1 from cluster 1’s baseline scenario retain ~88.6%
-# odds ratio: exp(-2.1451) = 0.117
-# So being in cluster 6 reduces odds of retention by ~88% relative to cluster 1.
-# Cluster 4: +0.463
-# odds ratio:exp(0.463)= 1.59, cluster 4 increases odds by ~59%.
-# prev_cluster 3: +0.418 even after controlling for current cluster and direction.
-# Staying in the same cluster increases odds by 23%, moving up increases odds by 37%.
+summary(cluster_direction_glm)
+
+# Compared to users who move down, taying in the same cluster increases retention odds by 23% and moving up increases retention odds by 17%
+# Current cluster strongly predicts 7-day retention. Users moving downward between clusters have the lowest retention.
+# Staying in the same cluster increases retention odds by ~23% vs downward movement.
+# Moving up increases retention odds by ~17% vs downward movement.
+# Directional change is more informative than simply “changed vs not changed.”
+
+# Interaction model
+glm(retained7d ~ factor(prev_cluster) * factor(cluster),
+    family = binomial,
+    data = df_states)
+
+# Markov transition matrix
+P<- prop.table(table(df_states$prev_cluster,
+                 df_states$cluster), 1)
+
+transition_df <- as.data.frame(as.table(P)) %>%
+  rename(
+    prev_cluster = Var1,
+    cluster = Var2,
+    prob = Freq
+  ) %>%
+  mutate(
+    prev_cluster = factor(prev_cluster),
+    cluster = factor(cluster)
+  )
+
+ggplot(transition_df,
+       aes(x = cluster,
+           y = prev_cluster,
+           fill = prob)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", prob)),
+            size = 3) +
+  scale_fill_gradient(
+    low = "#f7fbff",
+    high = "red",
+    name = "Transition\nProbability"
+  ) +
+  labs(
+    title = "Cluster Transition Matrix",
+    subtitle = "P(cluster_t+1 | cluster_t)",
+    x = "Current Cluster (t+1)",
+    y = "Previous Cluster (t)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(color = "black")
+  )
+
+# Cluster 1: Many clusters flow into it, may represent low engagement.
+# * 3 → 1 is extremely common (46%).
+# * 4 → 1 = 29%.
+# * 6 → 1 = 30%.
+# Cluster 2: Very stable and insulated.
+# Cluster 3: High retention (from earlier model) but unstable, likely high engagement but volatile.
+# Cluster 6: Most unstable cluster, likely behavioral transition state, could go back and change K to 5
 
 # Retention by current state and by transition
 state_ret <- df_states %>%
@@ -864,7 +941,7 @@ contrast_2_5<-contrast_clusters(cluster_summary_tidy, 2, 5)
 contrast_2_6<-contrast_clusters(cluster_summary_tidy, 2, 6)
 
 # Compare highest retention clusters
-high <- c(4, 3, 1)
+high <- c(4, 3, 6)
 
 wide_high <- cluster_summary_tidy %>%
   filter(cluster %in% high) %>%
@@ -873,9 +950,9 @@ wide_high <- cluster_summary_tidy %>%
 
 # Top 3 retention cluster diffs
 high_archetype_1 <- wide_high %>%
-  mutate(d43 = `4` - `3`, d31 = `3` - `1`) %>%
-  filter(d43 > 0, d31 > 0) %>%
-  arrange(desc(d43 + d31)) %>%
+  mutate(d43 = `4` - `3`, d36 = `3` - `6`) %>%
+  filter(d43 > 0, d36 > 0) %>%
+  arrange(desc(d43 + d36)) %>%
   slice_head(n = 20)
 
 # Now 4 to 1 contrast
@@ -930,6 +1007,7 @@ ret_by_cluster <- df_full_with_clusters %>%
 
 # Pick pairs within +/- 0.01 retention
 tol <- 0.01
+
 pairs <- tidyr::crossing(c1 = ret_by_cluster$cluster, c2 = ret_by_cluster$cluster) %>%
   filter(c1 < c2) %>%
   left_join(ret_by_cluster, by = c("c1" = "cluster")) %>%
@@ -953,9 +1031,13 @@ best_pair_contrasts<-if (nrow(pairs) > 0) {
 
 feature_cols <- get_feature_cols(df_full_with_clusters)
 
+num_feature_cols <- feature_cols[sapply(df_full_with_clusters[feature_cols], is.numeric)]
+
 df_div <- df_full_with_clusters %>%
   mutate(
-    feature_breadth = rowSums(across(all_of(feature_cols), ~ as.integer(replace_na(.x, 0) > 0)))
+    feature_breadth = rowSums(
+      across(all_of(num_feature_cols), ~ replace_na(.x, 0) > 0)
+    )
   )
 
 breadth_by_cluster <- df_div %>%
@@ -1015,6 +1097,8 @@ entropy_compare<-df_entropy %>%
     .groups = "drop"
   ) %>%
   arrange(desc(mean_entropy))
+
+entropy_compare
 
 # Cluster output table
 cluster_fact_sheet <- df_full_with_clusters %>%
@@ -1152,7 +1236,7 @@ for (i in seq_along(model_sheets)) {
 }
 
 # save workbook
-saveWorkbook(wb, "/Users/karstenwalker/Documents/Cluster_Analysis_V1.xlsx", overwrite = TRUE)
+saveWorkbook(wb, "/Users/karstenwalker/Documents/Cluster_Analysis_V2.xlsx", overwrite = TRUE)
 
 ### Next Steps
 # Remove pure volume metrics temporarily

@@ -24,6 +24,8 @@ theme_fancy <- function() {
           panel.grid.major.y = element_blank(),
           plot.title = element_text(hjust=0.5, size=28,face="bold"),
           plot.subtitle = element_text(hjust=0.5, size=20, face="italic"),
+          axis.text.x = element_text(size=12,face="bold"),
+          axis.text.y = element_text(size=12,face="bold"),
           legend.position = "bottom",
           plot.background=element_rect(fill="white"),
           panel.background=element_rect(fill="white"),

@@ -1,11 +1,18 @@
 ---
 title: "Parallel Trends Pre-Checks"
-output: github_document
+output: ipynb_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo=TRUE, warning = FALSE, message = FALSE)
-knitr::opts_chunk$set(fig.width=15, fig.height=10) 
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 15,
+  fig.height = 10,
+  fig.retina = 2,
+  dpi = 150
+)
 ```
 
 In this script we walk through boilerplate causal pre-checks to determine if our data meets the parallel trends assumption in the pre period. We only look at the most essential functions as there are many more esoteric checks contained in our helper script documented below that are likely not always necessary. Please see the appendix for a list of functions and their use.
@@ -17,8 +24,11 @@ In this script we walk through boilerplate causal pre-checks to determine if our
 4. We use linear regression to compare pre-intervention trends between groups.
 
 ```{r load_packages, warnings=FALSE, message=FALSE}
+# ---- Colab/Notebook-friendly setup ----
+# Use a CRAN mirror explicitly (important in non-interactive environments like Colab)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
 
-# Load required packages
+# Install + load required packages
 packages <- c(
   "dplyr",
   "tidyr",
@@ -52,12 +62,20 @@ suppressPackageStartupMessages(
 # Set seed for synthetic data gen and model fitting
 set.seed(7)
 
-# Load theme
-source("/Users/karstenwalker/Documents/GitHub/R/Helpers/themes.R")
+# Helper: source optional repo scripts if present (works locally, in Colab, or anywhere)
+safe_source <- function(path) {
+  if (file.exists(path)) {
+    source(path)
+    return(invisible(TRUE))
+  }
+  message(sprintf("Skipping source('%s') (file not found).", path))
+  invisible(FALSE)
+}
 
-# Load causal pre-check function
-source("/Users/karstenwalker/Documents/GitHub/R/Causal/causal_pre_check.R")
-
+# If you're running this in Colab, clone the repo (or upload these files) so these paths exist.
+safe_source("R/Helpers/themes.R")
+safe_source("R/Causal/causal_pre_check.R")
+safe_source("R/Causal/causal_by_group_functions_dev.R")
 ```
 
 For this example we are going to generate synthetic data that contains 10 cities: 5 have been treated and 5 have not. We design the data such that there are parallel pre-period trends and there is a significant increase in only the treated cities. There is also a spend column which differs across cities that we can add as a unit effect for a TWFE model.
@@ -124,7 +142,7 @@ Let's check out our data real quick
 report::report(sales_data%>%
                  select(-date))
 
-kbl(sales_data %>%
+sales_data %>%
   group_by(treat, city) %>%
   summarize(
     mean_sales = mean(sales, na.rm = TRUE),
@@ -135,8 +153,7 @@ kbl(sales_data %>%
     min_date = min(date),
     max_date = max(date)
   )%>%
-  arrange(city, treat))%>%
-  kable_minimal()
+  arrange(city, treat)
 
 ```
 Looks good, no missingness and plenty of variation that we built in.
