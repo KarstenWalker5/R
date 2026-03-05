@@ -4,10 +4,9 @@ library(doParallel)
 library(DALEX)
 library(dplyr)
 library(arrow)
+library(ingredients)   
 
-# ---------------------------
-# 0) Inputs
-# ---------------------------
+# Load Data
 # Store your Google Cloud project ID
 bq_auth()
 
@@ -15,8 +14,9 @@ project_id <- "compact-sylph-785"
 
 # Define your SQL query (example using a public dataset)
 sql <- "SELECT * 
-        FROM `compact-sylph-785.Karsten.EL_1pct_1yr_LI_sum_creator`
-        WHERE MOD(ABS(FARM_FINGERPRINT(CAST(user_id AS STRING))), 100) < 75"
+        FROM `compact-sylph-785.Karsten.EL_1pct_1yr_LI_sum_creator`  "
+
+# WHERE MOD(ABS(FARM_FINGERPRINT(CAST(user_id AS STRING))), 100) < 75
 
 # Run the query
 tb <- bq_project_query(project_id, sql)
@@ -30,22 +30,29 @@ source("/Users/karstenwalker/Documents/GitHub/R/Helpers/df_transformations.R")
 # Set Seed
 set.seed(7)
 
-# Download the results into an R data frame
+# Download the results into df
 el_data <- bq_table_download(tb)%>%
   select(-uid, -reported_user_type, -country_code, -retained7d, -retained90d, 
          -days_until_next_session, -cumulative_lifetime_sessions, -age, -platform, -account_type,
          -is_teacher_with_students, -session_count, -first_session_channel, -last_session_channel,
          -lifetime_sets_created,-never_created,-session_count_7d_avg, -set_pageviews_count_7d_avg, 
-         -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)
+         -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)%>%  
+  group_by(account_type)%>%
+  mutate(z_score = scale(flashcards_questions_answered)) %>%
+  filter(abs(z_score)<3,flashcards_questions_answered>0)%>%
+  ungroup()
 
 # Optional: read in saved file
-el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_no_avg_3_3.csv")
+el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_3.csv")
 
 # Note creater_of_content is defined as "User viewed their own content that day"
+# creator_of_content = 1 → User viewed at least one of their own created sets that day
+# recent_feed_clicks: count of clicks on "recent_feed" recommendations in the study funnel.
+#   * When a user clicks on content shown in the "recent feed" section of the study funnel/home feed. 
 # Remove course count since it is not as of that day
 
 # Set these
-outcome  <- "retained7d"
+outcome  <- "retained28d"
 
 time_col <- "date"
 
@@ -83,51 +90,91 @@ validation_data <- training(split_2)
 test_data <- testing(split_2)
 
 train_data<-train_data%>%
-  select(-creator_of_content)
+  select(-contains("_7d"), -creator_of_content)
 
 test_data<-test_data%>%
-  select(-creator_of_content)
+  select(-contains("_7d"), -creator_of_content)
 
 rm(tmp_20)
-
-#### USER LEVEL SPLIT ####
-# 1) Sample users into train/val/test (80/10/10)
-user_split <- initial_split(
-  el_data %>% distinct(user_id),
-  prop = 0.80
-)
-
-train_users <- training(user_split)$user_id
-temp_users  <- testing(user_split)$user_id
-
-set.seed(7)
-val_test_split <- initial_split(
-  tibble(user_id = temp_users),
-  prop = 0.50
-)
-
-val_users  <- training(val_test_split)$user_id
-test_users <- testing(val_test_split)$user_id
-
-# 2) Filter full data by user sets
-train_data <- el_data %>% filter(user_id %in% train_users)
-validation_data <- el_data %>% filter(user_id %in% val_users)
-test_data  <- el_data %>% filter(user_id %in% test_users)
-
-# 3) Drop columns evenly
-train_data <- train_data %>% select(-contains("_7d"), -creator_of_content)
-validation_data <- validation_data %>% select(-contains("_7d"), -creator_of_content)
-test_data <- test_data %>% select(-contains("_7d"), -creator_of_content)
 
 # Sanity check
 range(train_data[[time_col]], na.rm = TRUE)
 
 range(validation_data[[time_col]], na.rm = TRUE)
 
-range(test_data[[time_col]], na.rm = TRUE)
+# range(test_data[[time_col]], na.rm = TRUE)
+
+#### USER LEVEL SPLIT ####
+# Sample users into train/val/test (80/10/10)
+user_split <- initial_split(
+  el_data %>% distinct(user_id),
+  prop = 0.80
+)
+
+train_users <- training(user_split)$user_id
+
+temp_users  <- testing(user_split)$user_id
+
+val_test_split <- initial_split(
+  tibble(user_id = temp_users),
+  prop = 0.50
+)
+
+val_users  <- training(val_test_split)$user_id
+
+test_users <- testing(val_test_split)$user_id
+
+# Filter full data by user sets
+train_data <- el_data %>% filter(user_id %in% train_users)
+
+validation_data <- el_data %>% filter(user_id %in% val_users)
+
+test_data  <- el_data %>% filter(user_id %in% test_users)
+
+# Drop columns evenly
+# train_data <- train_data %>% select(-contains("_7d"), -creator_of_content)
+# validation_data <- validation_data %>% select(-contains("_7d"), -creator_of_content)
+# test_data <- test_data %>% select(-contains("_7d"), -creator_of_content)
+
+# 1) Split USERS into train / temp (80/20)
+user_split_1 <- initial_split(el_data %>% distinct(user_id), prop = 0.80)
+
+train_users <- training(user_split_1)$user_id
+
+tmp_users   <- testing(user_split_1)$user_id
+
+# Split temp USERS into validation / test (50/50 => 10/10 overall)
+user_split_2 <- initial_split(tibble(user_id = tmp_users), prop = 0.50)
+
+validation_users <- training(user_split_2)$user_id
+
+test_users       <- testing(user_split_2)$user_id
+
+# Filter full rows by user sets
+train_data <- el_data %>% filter(user_id %in% train_users)
+
+validation_data <- el_data %>% filter(user_id %in% validation_users)
+
+test_data <- el_data %>% filter(user_id %in% test_users)
+
+# Apply your feature drops consistently
+# drop_cols <- c("creator_of_content")  # add more if needed
+# 
+# train_data <- train_data %>% select(-contains("_7d"), -all_of(drop_cols))
+# 
+# validation_data <- validation_data %>% select(-contains("_7d"), -all_of(drop_cols))
+# 
+# test_data <- test_data %>% select(-contains("_7d"), -all_of(drop_cols))
+
+# Sanity check: no user overlap
+stopifnot(length(intersect(unique(train_data$user_id), unique(validation_data$user_id))) == 0)
+
+stopifnot(length(intersect(unique(train_data$user_id), unique(test_data$user_id))) == 0)
+
+stopifnot(length(intersect(unique(validation_data$user_id), unique(test_data$user_id))) == 0)
 
 # Drop original data to save memory
-write.csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_no_avg_3_3.csv", row.names = FALSE)
+write.csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_3.csv", row.names = FALSE)
 
 rm(el_data)
 
@@ -147,7 +194,7 @@ clf_recipe <- recipe(formula(paste(outcome, "~ .")), data = train_data) %>%
 cores_to_use <- max(1, parallel::detectCores(logical = FALSE) - 1)
 
 xgb_spec <- boost_tree(
-  trees = 400,          
+  trees = 500,          
   learn_rate = 0.1,
   tree_depth = 3,
   min_n = 20,
@@ -173,6 +220,7 @@ fit_train <- fit(clf_wf, data = train_data)
 
 # 5) Train on TRAIN, evaluate on test
 event_level <- "second"
+
 prob_col <- ".pred_1"
 
 # Score test set
@@ -221,13 +269,36 @@ test_metrics
 # 3 pr_auc      binary         0.829
 # 4 mn_log_loss binary         0.570
 
+# Sample 75% of training data for the next 3
 # 3rd run no averages
 # 1 accuracy    binary         0.691
 # 2 roc_auc     binary         0.686
 # 3 pr_auc      binary         0.823
 # 4 mn_log_loss binary         0.577
 
-# 3rd run remove 7d avgs
+# 4th run remove creator of content, has averages
+# 1 accuracy    binary         0.702
+# 2 roc_auc     binary         0.697
+# 3 pr_auc      binary         0.826
+# 4 mn_log_loss binary         0.572
+
+# 5th run no averages, remove creator_of_content
+# 1 accuracy    binary         0.691
+# 2 roc_auc     binary         0.682
+# 3 pr_auc      binary         0.820
+# 4 mn_log_loss binary         0.579
+
+# 6th run new split method, 75% sample
+# 1 accuracy    binary         0.697
+# 2 roc_a uc     binary         0.706
+# 3 pr_auc      binary         0.821
+# 4 mn_log_loss binary         0.576
+
+# 7th run run new split method, full data
+# 1 accuracy    binary         0.698
+# 2 roc_auc     binary         0.708
+# 3 pr_auc      binary         0.822
+# 4 mn_log_loss binary         0.575
 
 # 3) Confusion matrix
 conf_mat(
@@ -291,26 +362,27 @@ vip::vip(engine_fit, num_features = 50) +
   theme_minimal()
 
 # Save objects to remove and preserve memory
-
 artifact_path <- "/Users/karstenwalker/Documents/Modeling/Artifacts"
 
 dir.create(artifact_path, showWarnings = FALSE, recursive = TRUE)
 
-dir.create("artifacts", showWarnings = FALSE)
+# Save model + metadata
 
-# Save fitted workflow / model
 saveRDS(
   fit_train,
-  file = file.path(artifact_path, "fit_train.rds")
+  file = file.path(artifact_path, "el_fit7.rds")
 )
 
-# Save metadata you'll need later
+# Define predictor columns (exclude outcome + id + time)
+x_cols <- setdiff(names(train_data), c(outcome, id_cols, time_col))
+
 model_meta <- list(
   outcome     = outcome,
   prob_col    = prob_col,
   event_level = event_level,
   id_cols     = id_cols,
-  time_col    = time_col
+  time_col    = time_col,
+  x_cols      = x_cols
 )
 
 saveRDS(
@@ -318,57 +390,91 @@ saveRDS(
   file = file.path(artifact_path, "model_meta.rds")
 )
 
-write_parquet(
+# Save model outputs
+
+write.csv(
   test_scored,
-  sink = file.path(artifact_path, "test_scored.parquet")
+  file = file.path(artifact_path, "el_run7_test_scored.csv"),
+  row.names = FALSE
 )
 
-# RDS version
-saveRDS(
-  test_scored,
-  file = file.path(artifact_path, "test_scored.rds")
+write.csv(
+  train_data,
+  file = file.path(artifact_path, "el_run7_train.csv"),
+  row.names = FALSE
 )
 
-# Remove things to save memory
+write.csv(
+  validation_data,
+  file = file.path(artifact_path, "el_run7_val.csv"),
+  row.names = FALSE
+)
+
+# Save SHAP background + observation samples
+
+source_df <- train_data %>%
+  mutate(
+    date = as.Date(date),
+    !!outcome := factor(.data[[outcome]], levels = c("0", "1"))
+  )
+
+shap_bg <- source_df %>%
+  select(all_of(x_cols)) %>%
+  slice_sample(n = min(3000, n()))
+
+shap_obs <- source_df %>%
+  select(all_of(x_cols)) %>%
+  slice_sample(n = min(2000, n()))
+
+write.csv(
+  shap_bg,
+  file = file.path(artifact_path, "shap_bg.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  shap_obs,
+  file = file.path(artifact_path, "shap_obs.csv"),
+  row.names = FALSE
+)
+
+# Remove heavy objects from memory
+
 rm(
   el_data,
   train_data,
   test_data,
+  validation_data,
   test_scored,
   test_probs,
-  test_class
+  test_class,
+  clf_recipe,
+  clf_wf,
+  metrics_class,
+  user_split,
+  user_split_1,
+  user_split_2,
+  val_test_split
 )
 
 gc()
 
-# Optional: Pre-save only what SHAP needs
+# Load only SHAP-required objects
 
-x_cols <- setdiff(
-  names(test_scored),
-  c(model_meta$outcome, ".pred_class", ".pred_0", ".pred_1")
-)
-
-shap_df <- test_scored %>%
-  select(all_of(x_cols)) %>%
-  slice_sample(n = min(3000, n()))
-
-write_parquet(
-  shap_df,
-  file.path(artifact_path, "shap_df.parquet")
-)
-
-# Only data SHAP needs
-fit_train  <- readRDS(file.path(artifact_path, "fit_train.rds"))
-
+fit_train  <- readRDS(file.path(artifact_path, "el_fit7.rds"))
 model_meta <- readRDS(file.path(artifact_path, "model_meta.rds"))
 
-test_scored <- read_parquet(
-  file.path(artifact_path, "test_scored.parquet")
-)
+outcome     <- model_meta$outcome
+prob_col    <- model_meta$prob_col
+event_level <- model_meta$event_level
+id_cols     <- model_meta$id_cols
+time_col    <- model_meta$time_col
+x_cols      <- model_meta$x_cols
 
-# Load only SHAP shit
-fit_train <- readRDS(file.path(artifact_path, "fit_train.rds"))
-shap_df   <- read_parquet(file.path(artifact_path, "shap_df.parquet"))
+shap_bg  <- read.csv(file.path(artifact_path, "shap_bg.csv"))
+shap_obs <- read.csv(file.path(artifact_path, "shap_obs.csv"))
+
+stopifnot(identical(colnames(shap_bg), colnames(shap_obs)))
 
 # SHAP + DALEX
 
@@ -401,8 +507,7 @@ expl <- DALEX::explain(
   y     = as.numeric(train_y == "1"),   
   predict_function = pred_fun_prob1,
   label = "retention_model",
-  verbose = FALSE
-)
+  verbose = FALSE)
 
 # Global SHAP sample on subset to save memory
 # B=5 is fine for a quick look, but I’d use B=25–50 on a sample.
@@ -412,7 +517,7 @@ shap_rows <- sample.int(nrow(train_x), size = min(shap_n, nrow(train_x)))
 
 shap_global <- predict_parts(
   explainer = expl,
-  new_observation = train_x[shap_rows, , drop = FALSE],
+  new_observation = shap_obs,
   type = "shap",
   B = 25)
 
@@ -439,43 +544,63 @@ shap_local <- predict_parts(
 plot(shap_local, max_vars = 30) +
   ggplot2::labs(title = paste("Local SHAP for", example_id))
 
-# PDP
-# pick 1–3 important numeric features
-vars <- c("flashcards_answers_7d", "answer_view_ratio_7d")  # example names
+# 7) PDP (Partial Dependence)
+# How to read
+# As learn_mode_answer_rate_7d_avg increases from 0 → 1 holding all other features “averaged out”,
+# the model’s predicted retention probability decreases from ~0.675 → ~0.637. (3.8%)o
+# The model believes that a higher learn-mode answer rate is associated with lower retention.
+
+vars <- c("learn_mode_answer_rate_7d_avg", "sets_studied_rate_7d_avg", "study_modes_used_7d_avg")  # replace w/ real col names in x_cols
 
 pdp <- model_profile(
   explainer = expl,
   variables = vars,
-  type = "partial"   # PDP
+  type = "partial"
 )
 
-plot(pdp) + ggplot2::labs(title = "Partial Dependence Profiles")
+plot(pdp) +
+  ggtitle("Partial Dependence Profiles") +
+  theme_minimal()
+
+# Validate intuiton
+ggplot(train_data, aes(x = learn_mode_answer_rate_7d_avg)) +
+  geom_histogram(bins = 30)+
+  theme_minimal()
 
 # Feature importance stability (Permutation Importance)
+B_perm <- 10      # permutations inside model_parts
+R_reps <- 10      # repeated subsamples
 
-cv_parts <- purrr::map(cv_models, ~{
-  expl_cv <- DALEX::explain(
-    model = .x,
-    data  = train_x,
-    y     = as.numeric(train_y == "1"),
-    predict_function = pred_fun_prob1,
-    label = "cv",
-    verbose = FALSE
-  )
-  DALEX::model_parts(expl_cv, B = 10)   # permutation importance
+imp_reps <- map(1:R_reps, \(r) {
+  set.seed(100 + r)
+  idx <- sample.int(nrow(shap_bg), size = min(2000, nrow(shap_bg)))  # subsample rows
+  expl_r <- expl_single
+  expl_r$data <- shap_bg[idx, , drop = FALSE]
+  DALEX::model_parts(expl_r, B = B_perm, type = "difference")
 })
 
-# Combine + summarize stability
-parts_df <- bind_rows(cv_parts, .id = "fold") %>%
-  filter(variable != "_baseline_" & variable != "_full_model_")
+parts_df <- bind_rows(imp_reps, .id = "rep") %>%
+  filter(!variable %in% c("_baseline_", "_full_model_"))
 
 stability <- parts_df %>%
   group_by(variable) %>%
   summarise(
     mean_drop = mean(dropout_loss, na.rm = TRUE),
     sd_drop   = sd(dropout_loss, na.rm = TRUE),
+    cv        = sd_drop / pmax(abs(mean_drop), 1e-9),
     .groups = "drop"
   ) %>%
   arrange(desc(mean_drop))
 
 stability %>% slice_head(n = 30)
+
+# Conclusions so far
+# 1. Structural embedding (classes, folders) strongly increases retention.
+# 2. Volume of activity increases retention.
+# 3. Mode diversity increases retention.
+# 4. High efficiency in learn mode slightly decreases retention.
+
+# To-Do
+# 2D PDP: answer_rate × questions_answered
+# SHAP interaction values (if feasible)
+# Stratify SHAP by high vs low volume users

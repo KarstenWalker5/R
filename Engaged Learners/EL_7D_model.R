@@ -16,7 +16,7 @@ project_id <- "compact-sylph-785"
 
 # Define your SQL query (example using a public dataset)
 sql <- "SELECT * 
-        FROM `compact-sylph-785.Karsten.EL_1pct_1yr_LI_sum_creator`  "
+        FROM `compact-sylph-785.Karsten.EL_1yr_1pct_LI_complete_3_4`  "
 
 # WHERE MOD(ABS(FARM_FINGERPRINT(CAST(user_id AS STRING))), 100) < 75
 
@@ -38,7 +38,11 @@ el_data <- bq_table_download(tb)%>%
          -days_until_next_session, -cumulative_lifetime_sessions, -age, -platform, -account_type,
          -is_teacher_with_students, -session_count, -first_session_channel, -last_session_channel,
          -lifetime_sets_created,-never_created,-session_count_7d_avg, -set_pageviews_count_7d_avg, 
-         -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)
+         -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)%>%  
+  group_by(account_type)%>%
+  mutate(z_score = scale(flashcards_questions_answered)) %>%
+  filter(abs(z_score)<3,flashcards_questions_answered>0)%>%
+  ungroup()
 
 # Optional: read in saved file
 el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_3.csv")
@@ -172,7 +176,7 @@ stopifnot(length(intersect(unique(train_data$user_id), unique(test_data$user_id)
 stopifnot(length(intersect(unique(validation_data$user_id), unique(test_data$user_id))) == 0)
 
 # Drop original data to save memory
-write.csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_3.csv", row.names = FALSE)
+write.csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_4.csv", row.names = FALSE)
 
 rm(el_data)
 
