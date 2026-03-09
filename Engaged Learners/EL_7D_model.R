@@ -16,7 +16,8 @@ project_id <- "compact-sylph-785"
 
 # Define your SQL query (example using a public dataset)
 sql <- "SELECT * 
-        FROM `compact-sylph-785.Karsten.EL_1yr_1pct_LI_complete_3_4`  "
+        FROM `compact-sylph-785.Karsten.EL_1yr_1pct_LI_complete_3_4`  
+WHERE MOD(ABS(FARM_FINGERPRINT(CAST(user_id AS STRING))), 100) < 75"
 
 # WHERE MOD(ABS(FARM_FINGERPRINT(CAST(user_id AS STRING))), 100) < 75
 
@@ -34,24 +35,60 @@ set.seed(7)
 
 # Download the results into an R data frame
 el_data <- bq_table_download(tb)%>%
-  select(-uid, -reported_user_type, -country_code, -retained28d, -retained90d, 
-         -days_until_next_session, -cumulative_lifetime_sessions, -age, -platform, -account_type,
+  select(-uid, -reported_user_type, -retained28d, -retained90d, -country_code, -age, -platform, -account_type,
+         -days_until_next_session, -cumulative_lifetime_sessions,
          -is_teacher_with_students, -session_count, -first_session_channel, -last_session_channel,
          -lifetime_sets_created,-never_created,-session_count_7d_avg, -set_pageviews_count_7d_avg, 
-         -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)%>%  
-  group_by(account_type)%>%
-  mutate(z_score = scale(flashcards_questions_answered)) %>%
-  filter(abs(z_score)<3,flashcards_questions_answered>0)%>%
-  ungroup()
+         -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)%>%
+  filter(flashcards_questions_answered < quantile(flashcards_questions_answered, 0.995))
 
-# Optional: read in saved file
-el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_3.csv")
-
-# Note creater_of_content is defined as "User viewed their own content that day"
+# Note creator_of_content is defined as "User viewed their own content that day"
 # creator_of_content = 1 → User viewed at least one of their own created sets that day
 # recent_feed_clicks: count of clicks on "recent_feed" recommendations in the study funnel.
 #   * When a user clicks on content shown in the "recent feed" section of the study funnel/home feed. 
 # Remove course count since it is not as of that day
+
+df_clustered_uw<-read.csv(file="/Users/karstenwalker/Documents/Modeling/Artifacts/user_clusters_3_5.csv")%>%
+  select(-X)%>%
+  mutate(
+    week_start = as.Date(week_start_date),
+    week_start = floor_date(week_start, "week", week_start = 1))%>%
+  select(-week_start_date)
+
+# Ensure date type 
+el_data <- el_data %>%
+  mutate(
+    date = as.Date(date),
+    week_start = floor_date(date, "week", week_start = 1)  # Monday start
+  ) %>%
+  left_join(df_clustered_uw,
+            by = c("user_id", "week_start"))
+
+library(data.table)
+
+DT <- as.data.table(el_data)
+
+setorder(DT, user_id, date)
+
+# Fill down then up within each user_id
+DT[, cluster := nafill(cluster, type = "locf"), by = user_id]
+DT[, cluster := nafill(cluster, type = "nocb"), by = user_id]
+
+DT[is.na(cluster), cluster := -1L]
+
+DT[, cluster := as.integer(cluster)]
+
+el_data <- as_tibble(DT)
+
+detach(data.table)
+
+rm(DT)
+
+rm(df_clustered_uw)
+
+# Optional: read in saved file
+el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_5.csv")%>%
+  select(-week_start)
 
 # Set these
 outcome  <- "retained7d"
@@ -76,7 +113,8 @@ el_data <- el_data %>%
     !!outcome := factor(.data[[outcome]], levels = c("0", "1"))
   ) %>%
   filter(!is.na(.data[[outcome]])) %>%   # drop censored days
-  arrange(.data[[time_col]])
+  arrange(.data[[time_col]])%>%
+  select(-contains("sticky"))
 
 # 2) Time-aware 80/10/10 split 
 split_1 <- rsample::initial_time_split(el_data, prop = 0.80, lag = 0)
@@ -109,7 +147,7 @@ range(validation_data[[time_col]], na.rm = TRUE)
 #### USER LEVEL SPLIT ####
 # Sample users into train/val/test (80/10/10)
 user_split <- initial_split(
-  el_data %>% distinct(user_id),
+  el_data %>% distinct(user_id)%>%select(-week_start),
   prop = 0.80
 )
 
@@ -176,7 +214,11 @@ stopifnot(length(intersect(unique(train_data$user_id), unique(test_data$user_id)
 stopifnot(length(intersect(unique(validation_data$user_id), unique(test_data$user_id))) == 0)
 
 # Drop original data to save memory
-write.csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_4.csv", row.names = FALSE)
+write.csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_5.csv", row.names = FALSE)
+
+library(readr)
+
+write_csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_5.csv")
 
 rm(el_data)
 
@@ -302,6 +344,27 @@ test_metrics
 # 3 pr_auc      binary         0.822
 # 4 mn_log_loss binary         0.575
 
+# 8th run 3/5 new split, 75% of data, w/ cluster
+ # accuracy    binary         0.717
+ # roc_auc     binary         0.759
+ # pr_auc      binary         0.861
+ # mn_log_loss binary         0.539
+
+# 9th run, same as 8 but w/o cluster
+ # accuracy    binary         0.695
+ # roc_auc     binary         0.703
+ # pr_auc      binary         0.819
+ # mn_log_loss binary         0.578
+
+# Clustering adds meaningful signal. If it was co-linear AUC would barely change LogLoss would barely improve.
+
+# Feature importance
+engine_fit <- workflows::extract_fit_engine(fit_train)
+
+vip::vip(engine_fit, num_features = 50) +
+  labs(title = "7D Retention Model Feature Importance")+
+  theme_minimal()
+
 # 3) Confusion matrix
 conf_mat(
   test_scored,
@@ -354,13 +417,6 @@ ggplot(cal_df, aes(x = p_mean, y = y_rate)) +
   geom_point(aes(size = n)) +
   geom_abline(linetype = 2) +
   labs(title = "Calibration Plot (Test)", x = "Mean Predicted Probability (by decile)", y = "Observed Event Rate")+
-  theme_minimal()
-
-# Feature importance
-engine_fit <- workflows::extract_fit_engine(fit_train)
-
-vip::vip(engine_fit, num_features = 50) +
-  labs(title = "Feature Importance (XGBoost - Gain)")+
   theme_minimal()
 
 # Save objects to remove and preserve memory

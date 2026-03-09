@@ -29,6 +29,10 @@ tb <- bq_project_query(project_id, sql)
 
 source("/Users/karstenwalker/Documents/GitHub/R/Helpers/themes.R")
 
+source("/Users/karstenwalker/Documents/GitHub/R/Helpers/glm_summaries.R")
+
+source("/Users/karstenwalker/Documents/GitHub/R/Helpers/df_transformations.R")
+
 source("/Users/karstenwalker/Documents/GitHub/R/Helpers/df_transformations.R")
 
 # Set Seed
@@ -41,7 +45,7 @@ el_data <- bq_table_download(tb)%>%
          -lifetime_sets_created, -contains("engaged"))%>%
   group_by(account_type)%>%
   mutate(z_score = scale(flashcards_questions_answered)) %>%
-  filter(abs(z_score)<3,flashcards_questions_answered>0)%>%
+  filter(abs(z_score)<3)%>%
   ungroup()
 
 # %>%
@@ -187,18 +191,6 @@ cor_retention_ecdf<-cor_ecdf %>%
 
 ###### PCA + Clustering ######
 # 1 row per user/wk, probably redundant but a good check
-el_sub<-el_logged%>%
-  group_by(user_id, week)%>%
-  filter(row_number()==1)%>%
-  ungroup()
-
-# Drop columns not used for clustering
-df_entity <- el_sub%>%
-  ungroup() %>%
-  select(-contains("retained"), -contains("week"), -year,
-         -age)
-
-# Create an ID lookup for post-clustering
 ids <- el_logged%>%
   group_by(user_id, week)%>%
   filter(row_number()==1)%>%
@@ -206,7 +198,13 @@ ids <- el_logged%>%
   select(user_id, week)
 
 # Replace NA
-X <- df_entity %>%
+X <- el_logged%>%
+  group_by(user_id, week)%>%
+  filter(row_number()==1)%>%
+  ungroup()%>%
+  ungroup() %>%
+  select(-contains("retained"), -contains("week"), -year,
+         -age) %>%
   select(-user_id) %>%
   select(where(is.numeric)) %>%
   mutate(across(everything(), ~ replace_na(.x, 0)))
@@ -224,8 +222,6 @@ stopifnot(!anyNA(X_scaled))
 
 ### PCA
 # Fit PCA on a sample for speed, then project full dataset
-set.seed(1)
-
 n_for_pca <- min(nrow(X_scaled), 200000)
 
 idx_pca <- sample(seq_len(nrow(X_scaled)), n_for_pca)
@@ -322,15 +318,26 @@ pred <- ClusterR::predict_MBatchKMeans(
 
 clusters <- if (is.list(pred)) pred$clusters else pred
 
+# Remove stuff no longer needed
+rm(X_scaled)
+rm(X_pcs_full)
+rm(X)
+
 # Build mapping table
 df_clustered_uw <- ids %>%
   mutate(cluster = clusters) %>%
   distinct(user_id, week, .keep_all = TRUE)   
 
 # Join back to full dataset
-df_full_with_clusters <- el_sub%>%
+df_full_with_clusters <- el_logged%>%
   ungroup() %>%
   inner_join(df_clustered_uw, by = c("user_id", "week"))
+
+# Save clusters and IDs to join to modeling df
+write.csv(df_full_with_clusters%>%
+            select(user_id, cluster, week_start_date, week_end_date), file="/Users/karstenwalker/Documents/Modeling/Artifacts/user_clusters_3_5.csv")
+
+write.csv(df_full_with_clusters, file="/Users/karstenwalker/Documents/Modeling/Artifacts/cluster_full_df_3_5.csv")
 
 # Join clusters back to a frame that includes retention
 retention_summary <- el_data %>%
@@ -508,7 +515,14 @@ df_full_with_clusters2 %>%
   ) %>%
   arrange(desc(lift7))
 
-### Computer cluster stats
+### Compute cluster stats
+
+df_full_with_clusters %>%
+  group_by(cluster) %>%
+  summarise(
+    pct_rows_zero = mean(flashcards_questions_answered_log == 0, na.rm = TRUE) * 100,
+    n = n()
+  )
 
 # Build a "global mean" named vector (after back-transforming *_log)
 global_means <- df_full_with_clusters %>%
@@ -660,34 +674,40 @@ transition_matrix
 # Transition Matrix Summary (P(cluster_t+1 | cluster_t))
 
 # Overall Structure
-# - Clusters 5 and 6 are highly stable (~70% stay probability).
-# - Clusters 2 and 4 show moderate stability (~50% stay).
-# - Clusters 1 and 3 are most transitional (~33–39% stay).
+# * Cluster 5 is the most stable state (~67% stay probability).
+# * Clusters 6 and 3 show moderate stability (~50% stay).
+# * Cluster 4 is moderately persistent (~45% stay).
+# * Cluster 2 has lower stability (~37% stay).
+# * Cluster 1 is the most transitional (~29% stay).
 
 # Behavioral Interpretation
-# - Clusters 5 and 6 likely represent persistent, high-engagement states.
-# - Clusters 2 and 4 appear to be mid-level or developing states.
-# - Clusters 1 and 3 function as transitional or redistribution states.
+# * Cluster 5 represents the dominant low engagement absorbing state.
+# * Cluster 6 represents the high engagement anchor state.
+# * Clusters 2, 3, and 4 represent mid level engagement tiers.
+# * Cluster 1 functions as a volatile redistribution state.
 
 # Major Flow Patterns
-# - Cluster 1 redistributes broadly (not an absorbing sink).
-# - Cluster 2 frequently transitions to Cluster 5 (~33%).
-# - Cluster 3 feeds into Clusters 5 and 6 (~45% combined).
-# - Clusters 5 and 6 show limited outward leakage.
+# * Clusters 2, 3, 4, and 6 all feed meaningfully into Cluster 5.
+# * Cluster 4 transitions to Cluster 5 at ~38%.
+# * Cluster 6 transitions to Cluster 5 at ~29%.
+# * Cluster 1 redistributes broadly and does not act as an absorbing sink.
+# * Very little flow moves back into Cluster 1 from higher states.
 
 # Structural Assessment
-# - No pathological absorbing cluster.
-# - Clear separation between stable and transitional states.
-# - Dynamics resemble a coherent behavioral Markov system.
+# * Clear absorbing low engagement state in Cluster 5.
+# * Clear high engagement anchor in Cluster 6.
+# * Mid tier states transition predictably toward Cluster 5.
+# * System resembles a coherent behavioral lifecycle funnel.
 
 # Strategic Implications
-# - Retention likely strongest in Clusters 5 and 6.
-# - Movement into 5/6 may represent maturation or engagement growth.
-# - Clusters 1 and 3 are key monitoring targets for volatility.
+# * Retention is weakest in Cluster 5 and strongest in Cluster 6.
+# * Preventing movement into Cluster 5 should improve retention.
+# * Cluster 1 users require monitoring due to high volatility.
+# * Movement patterns are directionally consistent with retention gradients.
 
 # Conclusion
-# - k = 6 appears structurally appropriate.
-# - Cluster system shows stability, interpretability, and meaningful lifecycle dynamics.
+# * k = 6 is structurally clean and interpretable.
+# * The cluster system shows ordered engagement tiers and meaningful lifecycle dynamics.
 
 stability <- transitions %>%
   filter(cluster == next_cluster) %>%
@@ -695,6 +715,18 @@ stability <- transitions %>%
   rename(stay_prob = transition_prob)
 
 stability
+
+# * Cluster 5 is the most stable state (~67% persistence).
+# * Clusters 6 and 3 show moderate stability (~50% persistence).
+# * Cluster 4 has moderate persistence (~45%).
+# * Cluster 2 is less stable (~37%).
+# * Cluster 1 is the most volatile (~29% persistence).
+
+# * Cluster 5 represents a persistent low engagement state.
+# * Cluster 6 represents a stable high engagement state.
+# * Clusters 3 and 4 are mid tier states with moderate stickiness.
+# * Cluster 2 is semi transitional.
+# * Cluster 1 is highly transitional and redistributive.
 
 # How many unique clusters each user occupies across all weeks
 user_cluster_span <- df_full_with_clusters %>%
@@ -707,7 +739,10 @@ user_cluster_span <- df_full_with_clusters %>%
 # table
 table(user_cluster_span$n_clusters_visited)
 
-# 70.7% in 1 cluster, 24.5% in 2
+# * Most users occupy persistent engagement tiers.
+# * A minority of users exhibit meaningful behavioral mobility.
+# * Cluster transitions likely reflect real engagement change rather than instability.
+
 # At some point most users had not activated
 pct_visited<-user_cluster_span %>%
   count(n_clusters_visited) %>%
@@ -719,35 +754,24 @@ pct_visited<-user_cluster_span %>%
 pct_visited
 
 # User Cluster Span Summary
+# Stability Interpretation
+# * The majority of users remain in one or two clusters over time.
+# * Only a small fraction visit 4 or more clusters.
+# * Very few users traverse the entire state space.
 
-# What This Measures
-# - For each user: total number of distinct clusters occupied across all observed weeks.
-# - Captures longitudinal stability of cluster assignments.
+# Structural Assessment
+# * Clusters represent relatively stable behavioral regimes.
+# * Movement exists but is not excessive.
+# * Low incidence of full span traversal suggests limited noise fragmentation.
 
-# Distribution of Cluster Span
-# - ~70% of users remain in exactly 1 cluster (high stability).
-# - ~24–25% of users visit exactly 2 clusters (limited transition).
-# - ~10% visit 3 clusters.
-# - Very small fraction visit 4+ clusters (<3%).
+# Lifecycle Implication
+# * Most users occupy persistent engagement tiers.
+# * A minority of users exhibit meaningful behavioral mobility.
+# * Cluster transitions likely reflect real engagement change rather than instability.
 
-# Structural Interpretation
-# - Majority of users occupy a single persistent behavioral state.
-# - Most movement is limited to one transition (1 → 2 clusters).
-# - Very few users bounce across many clusters, indicating low noise.
-
-# Validation of Segmentation
-# - Clusters are not overly fragmented.
-# - Behavioral states appear well-separated.
-# - Longitudinal volatility is limited to a small minority.
-
-# Behavioral Implication
-# - System resembles stable engagement regimes with occasional shifts.
-# - Supports interpretability of clusters as meaningful user states.
-# - Suggests k = 6 is not overfitting.
-
-# Overall Conclusion
-# - Cluster assignments are largely stable over time.
-# - Observed transitions likely reflect real behavioral change rather than clustering instability.
+# Conclusion
+# * The 6-cluster system shows reasonable longitudinal stability.
+# * Behavioral states appear structured rather than randomly fluctuating.
 
 # Movement rate
 # < 20% → mostly stable types
@@ -763,9 +787,6 @@ movement_rate <- transitions %>%
   mutate(move_rate = moves / total_transitions)
 
 movement_rate
-
-# ~40.8% of transitions involve movement between clusters.
-# ~59.2% of transitions remain in the same cluster.
 
 # Heatmap
 ggplot(transitions, aes(x = factor(cluster), 
@@ -806,14 +827,6 @@ df_states <- df_full_with_clusters %>%
   ungroup()
 
 # State vs. retention
-# Staying in cluster 3 93.7% retention
-# 1 > 3 is 89.8%
-# Staying in 1 is the worst outcome, but  3 >1 only has 65.8% retentin
-# 6 to 4 puts you into top tier retention.
-# 1 to 6 cuts retention dramatically.
-# 4 or 5 to 6 is catastrophic.
-# Users who move 6 to 1 retain at ~87%, stay in 6 retain at ~49%, fall 4 → 6 retain at ~56%.
-
 state_vs_ret<-df_states %>%
   filter(!is.na(transition)) %>%
   group_by(transition) %>%
@@ -837,32 +850,33 @@ print(state_vs_ret%>%
 #   - n  = number of observed transitions
 #   - r7 = mean 7-day retention for that transition
 
-# Coverage / Scale
-# - Evaluates all observed transitions across 6 clusters (up to 36 transition types).
-# - Results show both high-frequency "stay" transitions (e.g., 5->5, 2->2, 6->6)
-#   and lower-frequency moves between clusters.
+# Destination cluster dominates retention outcomes.
+# * All transitions ending in Cluster 6 have the highest retention (0.90 to 0.93).
+# * 6->6 is the strongest state with ~93% 7d retention.
 
-# Key Retention Patterns Observed
-# - Highest r7 transitions are mostly moves into / within cluster 4 (e.g., 2->4, 1->4, 4->4) with r7 ~0.94–0.96.
-# - Large-volume transitions include:
-#   - 5->5 (very large n) with r7 ~0.56
-#   - 2->2 (large n) with r7 ~0.91
-#   - 6->6 (large n) with r7 ~0.77
-#   - 2->5 (large n) with r7 ~0.60
+# Cluster 2 represents a strong upper mid state.
+# * 2->2 shows ~82% retention.
+# * Transitions into 2 generally perform well (0.75 to 0.79 range).
 
-# Notable Low-Retention Region
-# - Transitions ending in cluster 5 tend to have the lowest r7 (e.g., 6->5, 1->5, 3->5, 5->5) ~0.51–0.56.
-# - This suggests cluster 5 is a low-retention “sink” state in this labeling scheme.
+# Cluster 4 and 3 represent mid tier states.
+# * 4->4 ~70% retention.
+# * 3->3 ~65% retention.
+# * Transitions among 3 and 4 are moderate but clearly below Cluster 6.
 
-# Interpretation / Implications
-# - Retention appears to depend strongly on destination cluster (current state), not just whether a move occurred.
-# - Moves into cluster 4 are associated with very high retention, but many have small n (interpret cautiously).
-# - High-volume transitions provide the most reliable estimates; low-n transitions can be noisy.
+# Cluster 5 is the clear low retention sink.
+# * 5->5 ~47% retention with very large volume.
+# * All transitions into 5 range from ~39% to ~54%.
+# * Cluster 5 materially drives overall churn risk.
 
-# Recommended Next Steps
-# - Plot r7 heatmap by (prev_cluster x cluster) and annotate with n for reliability.
-# - Consider shrinkage / minimum-n thresholds (e.g., n >= 1,000) before ranking transitions.
-# - Validate whether cluster labels are ordered by engagement; if not, interpret clusters by feature profiles.
+# Directional pattern is consistent.
+# * Moves into 6 sharply increase retention.
+# * Moves into 5 sharply decrease retention.
+# * Downward transitions toward 5 show the lowest outcomes.
+
+# Structural Assessment
+# * Retention tiers are cleanly ordered by destination cluster.
+# * High volume transitions reinforce the lifecycle funnel into Cluster 5.
+# * Cluster 6 functions as the high engagement anchor state.
 
 # Simple regression of current cluster vs prev
 cluster_move_glm1<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + changed_cluster,
@@ -871,13 +885,38 @@ cluster_move_glm1<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) + cha
 
 summary(cluster_move_glm1)
 
-# Intercept: baseline retention ~60%
-# Current cluster
-# * Cluster 3 has dramatically higher retention than cluster 1. Clusters 4 and 6 are also very strong.
-# * Suggests clusters meaningfully separate users by engagement/quality.
-# Previous cluster
-# Past cluster has some predictive value, but much weaker than current cluster. Being in cluster 3 previously still improves retention odds.
-# Summary: Retention is driven mostly by current state, not historical state.
+# Baseline = users in cluster 1, previously in cluster 1, who did NOT change clusters.
+# Implied baseline retention ≈ plogis(0.72) ≈ 0.67.
+
+# Effect of Current Cluster (dominant driver)
+# * Cluster 6: strongly positive (β ≈ +1.46) → dramatically higher retention than cluster 1 (odds ~4.3x).
+# * Cluster 2: positive (β ≈ +0.52) → meaningfully higher retention than cluster 1 (odds ~1.7x).
+# * Cluster 3: slightly negative (β ≈ -0.13) → modestly lower retention than cluster 1.
+# * Cluster 4: slightly negative and marginally significant.
+# * Cluster 5: strongly negative (β ≈ -0.99) → substantially lower retention (odds ~0.37x).
+
+# Interpretation:
+# * Destination cluster is the strongest predictor of retention.
+# * Cluster 6 is the clear high-retention state.
+# * Cluster 5 is the clear low-retention state.
+
+# Effect of Previous Cluster
+# * Previous cluster 6 has a strong positive effect (β ≈ +0.56).
+# * Previous clusters 2, 4, and 5 have moderate positive effects.
+# * Previous cluster 3 is not significant.
+# * Past state matters, but less than current cluster.
+
+# Effect of Changing Clusters
+# * changed_cluster β ≈ -0.16 (highly significant).
+# * Odds ratio ≈ exp(-0.16) ≈ 0.85.
+# * Changing clusters reduces retention odds by ~15%, holding current and previous clusters constant.
+# * Behavioral instability independently lowers retention.
+
+# Overall Conclusion
+# * Current cluster is the primary determinant of retention.
+# * Cluster 6 drives strong retention, Cluster 5 drives churn risk.
+# * Movement between clusters carries a meaningful retention penalty.
+# * Retention is largely determined by present state, with prior state and stability adding secondary signal.
 
 # Replace changed_cluster with directional movement
 df_states <- df_states %>%
@@ -895,17 +934,58 @@ cluster_direction_glm<-glm(retained7d ~ factor(cluster) + factor(prev_cluster) +
                            family = binomial)
 
 summary(cluster_direction_glm)
+# Baseline = users in cluster 1, previously in cluster 1, who moved down.
+# Implied baseline retention ≈ plogis(0.60) ≈ 0.65.
 
-# Compared to users who move down, taying in the same cluster increases retention odds by 23% and moving up increases retention odds by 17%
-# Current cluster strongly predicts 7-day retention. Users moving downward between clusters have the lowest retention.
-# Staying in the same cluster increases retention odds by ~23% vs downward movement.
-# Moving up increases retention odds by ~17% vs downward movement.
-# Directional change is more informative than simply “changed vs not changed.”
+# Current cluster strongly predicts 7 day retention.
+# * Cluster 6 has the highest retention (β ≈ +1.54, odds ~4.7x vs cluster 1).
+# * Cluster 2 meaningfully increases retention (β ≈ +0.52, odds ~1.7x).
+# * Cluster 3 is slightly lower than cluster 1.
+# * Cluster 4 is not significantly different from cluster 1.
+# * Cluster 5 is substantially lower retention (β ≈ -0.94, odds ~0.39x).
+
+# Previous cluster has smaller but meaningful effects.
+# * Previous cluster 6 has a strong positive effect.
+# * Previous clusters 2 and 4 increase retention odds.
+# * Previous cluster 5 has a small positive effect.
+# * Previous cluster 3 is not significant.
+# * Current state remains much more important than prior state.
+
+# Compared to users who move down:
+# * Staying in the same cluster increases retention odds by ~13% (exp(0.124) ≈ 1.13).
+# * Moving up decreases retention odds by ~7% (exp(-0.071) ≈ 0.93) after controlling for destination cluster.
+
+# Direction adds signal, but current destination cluster captures most of the engagement effect.
+# Retention is primarily determined by where the user is now, with movement direction providing modest incremental information.
 
 # Interaction model
 glm(retained7d ~ factor(prev_cluster) * factor(cluster),
     family = binomial,
     data = df_states)
+
+# Retention is driven by the full transition, not just current cluster or direction.
+
+# Cluster 6 is the highest retention destination overall (strong positive main effect), while Cluster 5 is the lowest (large negative main effect).
+
+# Several transitions materially outperform their main effects.
+# * Moves from cluster 2 into cluster 2 show strong positive interaction effects.
+# * Moves from cluster 5 into cluster 6 and from cluster 2 into cluster 6 materially exceed what the main cluster effects alone would predict.
+# * Some moves into cluster 2 from clusters 3, 4, and 5 also outperform baseline expectations.
+
+# Some transitions underperform relative to their main effects.
+# * Certain moves from cluster 6 into clusters 3 and 4 show negative interaction terms.
+# * Some transitions into cluster 5 underperform even after accounting for its already low baseline retention.
+# * Remaining in cluster 6 from cluster 6 shows a negative interaction relative to its strong main effect, indicating diminishing incremental lift.
+
+# The interaction model shows that not all upward or downward moves behave the same.
+# * Specific origin to destination pairs meaningfully alter retention odds.
+# * The effect of moving into a cluster depends strongly on where the user came from.
+
+# Large reduction in deviance versus null confirms strong explanatory power.
+# Lower AIC relative to simpler models suggests the full transition specification fits better.
+
+# Overall, retention depends on the exact cluster_t to cluster_t+1 transition.
+# Modeling the full interaction captures transition specific effects that are masked in simpler direction or change indicators.
 
 # Markov transition matrix
 P<- prop.table(table(df_states$prev_cluster,
@@ -946,26 +1026,54 @@ ggplot(transition_df,
     axis.text = element_text(color = "black")
   )
 
-# Cluster 1: Many clusters flow into it, may represent low engagement.
-# * 3 → 1 is extremely common (46%).
-# * 4 → 1 = 29%.
-# * 6 → 1 = 30%.
-# Cluster 2: Very stable and insulated.
-# Cluster 3: High retention (from earlier model) but unstable, likely high engagement but volatile.
-# Cluster 6: Most unstable cluster, likely behavioral transition state, could go back and change K to 5
+# Clusters 5 and 6 are the most stable states with indicating strong behavioral stickiness.
+# Clusters 3 and 4 show moderate stability around 50%, suggesting semi-persistent engagement states.
+# Clusters 1 and 2 are the most transitional, with only ~29% to 37% staying, indicating higher volatility.
+# Cluster 1 redistributes broadly, especially into clusters 4 and 5, and does not act as a churn sink.
+# Cluster 4 frequently transitions into cluster 5, suggesting sequential upward engagement movement.
+# Clusters 5 and 6 show limited outward leakage, reinforcing their role as stable high-engagement states.
+# Overall, the system reflects a structured behavioral lifecycle with clear stable states and identifiable transitional pathways.
 
 # Retention by current state and by transition
-state_ret <- df_states %>%
+state_ret7 <- df_states %>%
   group_by(cluster) %>%
   summarise(n = n(),
             r7 = mean(retained7d, na.rm = TRUE),
             .groups = "drop")
 
-transition_ret <- df_states %>%
+transition_ret7 <- df_states %>%
   filter(!is.na(transition)) %>%
   group_by(transition) %>%
   summarise(n = n(),
             r7 = mean(retained7d, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(n))
+
+state_ret28 <- df_states %>%
+  group_by(cluster) %>%
+  summarise(n = n(),
+            r28 = mean(retained28d, na.rm = TRUE),
+            .groups = "drop")
+
+transition_ret28 <- df_states %>%
+  filter(!is.na(transition)) %>%
+  group_by(transition) %>%
+  summarise(n = n(),
+            r28 = mean(retained28d, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(n))
+
+state_ret28_sticky <- df_states %>%
+  group_by(cluster) %>%
+  summarise(n = n(),
+            r28 = mean(retained28d_sticky, na.rm = TRUE),
+            .groups = "drop")
+
+transition_ret28_sticky <- df_states %>%
+  filter(!is.na(transition)) %>%
+  group_by(transition) %>%
+  summarise(n = n(),
+            r28 = mean(retained28d_sticky, na.rm = TRUE),
             .groups = "drop") %>%
   arrange(desc(n))
 
@@ -985,54 +1093,13 @@ df_runs <- df_states %>%
     .groups = "drop"
   )
 
-# Summary
-# * There is a dominant behavioral pattern per user.
-# * Some users move up/down activation levels.
-# * Movement is limited (mostly 1–3 clusters).
-# * Clusters likely represent engagement tiers or phases.
-# * Should not use for modeling since they represent states, could use prior cluster as lagging indicator
-# Move rate = 0.463 → ~46% of week-to-week transitions change cluster.
-# Ever changed = 0.414 → ~41% of users change cluster at least once.
-# Clusters visited: 58.6% stay in 1 cluster; 26.7% visit 2; 11% visit 3.
-# Stay probabilities
-#   * c6: 0.625 (stickiest)
-#   * c2: 0.574
-#   * c4: 0.539
-#   * c1: 0.467
-#   * c3: 0.340
-#   * c5: 0.342
-# This is not user personality types, which would show much higher diagonals and much lower move rate.
-# Looks like engagement states where people move between levels with some stickiness for the big states (especially cluster 6).
-
-###### Initial insights ######
-# primarily separating:
-# * Low activation free users, casual/low-commitment users who never fully activate (cluster 6)
-# * Moderate free users (cluster 2, 7)
-# * High activation users, fully activated habitual learners (cluster 4, 3)
-# * Paid-heavy engaged users (cluster 8, 5)
-# The retention structure aligns mostly with:
-# * Engagement intensity
-# * Some monetization influence
-# * Not strongly with role
-#
-# Key Takeaways
-# * Clusters are not personality types. This is a state system, not identity.
-#   * 46% week-to-week movement
-#   * 41% of users ever change cluster
-#   * Stay probabilities mostly 0.34–0.62
-# *  Clusters represent engagement regimes
-#   * Likely something like Cluster 6 > Low activation, Cluster 2/5 > Moderate activation, 
-#     Cluster 4 > High creator activation, Cluster 3 > High consumer activation
-# * Retention is state-dependent.
-# * Your cluster-only logistic regression  explains ~15% deviance, large for behavioral data.
-
 ### Cluster drivers
 # Compare
-# * 4 vs 6 (retention high/low respectively)
-# * 4 vs 3 (both high retention)
-# * 3 vs 6 (similar retention, different paid)
-# * 2 vs 4 (middle clusters)
-# * 1 vs 2 (lower-mid retention)
+# * 6 vs 5 (retention high/low respectively)
+# * 6 vs 2 (high vs. upper mid)
+# * 2 vs 5 (upper mid vs. low)
+# * 3 vs 4 (middle clusters)
+# * 1 vs 5 (lower volatile vs. low sink)
 
 cluster_drivers <- cluster_summary_tidy %>%
   filter(abs(pct_lift_vs_global) > 20) %>%   # only meaningful differences
@@ -1040,17 +1107,17 @@ cluster_drivers <- cluster_summary_tidy %>%
   slice_max(abs(pct_lift_vs_global), n = 10) %>%
   arrange(cluster, desc(abs(pct_lift_vs_global)))
 
-# Why is cluster 4 so much higher?
+# Why is cluster 6 so much higher?
 comparison <- cluster_summary_tidy %>%
-  filter(cluster %in% c(4, 6)) %>%
+  filter(cluster %in% c(6, 2)) %>%
   select(cluster, metric, pct_lift_vs_global) %>%
   pivot_wider(names_from = cluster, values_from = pct_lift_vs_global) %>%
   mutate(
-    diff_4_vs_6 = `4` - `6`
+    diff_6_vs_2 = `6` - `2`
   )
 
 comparison %>%
-  arrange(desc(abs(diff_4_vs_6))) %>%
+  arrange(desc(abs(diff_6_vs_2))) %>%
   slice_head(n = 20)
 
 # function for contrasting clusters so I don't copy/paste this shit
@@ -1065,16 +1132,20 @@ contrast_clusters <- function(df, c1, c2, top_n = 15) {
 }
 
 # Check contrasts
-contrast_4_6<- contrast_clusters(cluster_summary_tidy, 4, 6)
+contrast_6_2<- contrast_clusters(cluster_summary_tidy, 6, 2)
 
-contrast_4_3<-contrast_clusters(cluster_summary_tidy, 4, 3)
+contrast_6_5<- contrast_clusters(cluster_summary_tidy, 6, 5)
+
+contrast_6_2<-contrast_clusters(cluster_summary_tidy, 6, 2)
 
 contrast_2_5<-contrast_clusters(cluster_summary_tidy, 2, 5)
 
-contrast_2_6<-contrast_clusters(cluster_summary_tidy, 2, 6)
+contrast_3_4<-contrast_clusters(cluster_summary_tidy, 3, 4)
+
+contrast_1_5<- contrast_clusters(cluster_summary_tidy, 1, 5)
 
 # Compare highest retention clusters
-high <- c(4, 3, 6)
+high <- c(6, 2, 1)
 
 wide_high <- cluster_summary_tidy %>%
   filter(cluster %in% high) %>%
@@ -1082,10 +1153,11 @@ wide_high <- cluster_summary_tidy %>%
   pivot_wider(names_from = cluster, values_from = pct_lift_vs_global)
 
 # Top 3 retention cluster diffs
+# Top 3 retention cluster diffs
 high_archetype_1 <- wide_high %>%
-  mutate(d43 = `4` - `3`, d36 = `3` - `6`) %>%
-  filter(d43 > 0, d36 > 0) %>%
-  arrange(desc(d43 + d36)) %>%
+  mutate(d62 = `6` - `2`, d21 = `2` - `1`) %>%
+  filter(d62 > 0, d21 > 0) %>%
+  arrange(desc(d62 + d21)) %>%
   slice_head(n = 20)
 
 # Now 4 to 1 contrast
@@ -1369,7 +1441,7 @@ for (i in seq_along(model_sheets)) {
 }
 
 # save workbook
-saveWorkbook(wb, "/Users/karstenwalker/Documents/Cluster_Analysis_V2.xlsx", overwrite = TRUE)
+saveWorkbook(wb, "/Users/karstenwalker/Documents/Cluster_Analysis_3_5.xlsx", overwrite = TRUE)
 
 ### Next Steps
 # Remove pure volume metrics temporarily
