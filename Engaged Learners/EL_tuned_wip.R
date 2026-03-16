@@ -78,13 +78,14 @@ clf_recipe <- recipe(formula(paste(outcome, "~ .")), data = train_data) %>%
 #### 5) Targeted XGBoost Spec (Tunable) ####
 xgb_spec_tune <-
   boost_tree(
-    trees = 300,            # IMPORTANT: keep tuning fast
+    trees = 300,            # max trees; early stopping often stops before this
     learn_rate = 0.05,
     tree_depth = tune(),
     min_n = tune(),
     loss_reduction = tune(),
     sample_size = tune(),   # integer count of rows
-    mtry = tune()           # integer count of predictors
+    mtry = tune(),          # integer count of predictors
+    stop_iter = 15          # stop if no improvement for 15 rounds (needs validation set below)
   ) %>%
   set_mode("classification") %>%
   set_engine(
@@ -93,7 +94,8 @@ xgb_spec_tune <-
     eval_metric = c("auc", "aucpr"),
     tree_method = "hist",
     nthread = cores_to_use,
-    verbose = 1
+    verbose = 1,
+    validation = 0.1        # 10% of train held out for early-stopping checks
   )
 
 #### 6) Workflow ####
@@ -103,21 +105,21 @@ xgb_wf <- workflow() %>%
 
 #### 7) Tuning Parameter Ranges (Working) ####
 xgb_params <- parameters(
-  tree_depth(range = c(3L, 5L)),
-  min_n(range = c(30L, 120L)),
-  loss_reduction(range = c(0, 3)),
+  tree_depth(range = c(2L, 7L)),
+  min_n(range = c(20L, 150L)),
+  loss_reduction(range = c(-2, 4)),
   
   # boost_tree(sample_size=) expects a proportion, so use sample_prop()
-  sample_size = sample_prop(range = c(0.6, 1.0)),
+  sample_size = sample_prop(range = c(0.5, 1.0)),
   
   # With ~24 predictors, this is fine as an integer count
-  mtry(range = c(8L, 24L))
+  mtry(range = c(6L, 24L))
 )
 
 xgb_params <- finalize(xgb_params, training = train_data)
 
 #### 8) Tuning Grid ####
-grid <- grid_latin_hypercube(xgb_params, size = 12)
+grid <- grid_latin_hypercube(xgb_params, size = 28)
 
 #### 9) Create a single validation resample (no CV) ####
 train_val_data <- bind_rows(train_data, validation_data)
@@ -136,6 +138,7 @@ ctrl <- control_grid(
   parallel_over = "resamples"
 )
 
+# Option A: full grid (28 configs) — ~2–2.5x longer than original 12; early stopping shortens each fit
 res <- tune_grid(
   xgb_wf,
   resamples = val_rs,   # single validation resample
@@ -143,6 +146,16 @@ res <- tune_grid(
   metrics = metrics,
   control = ctrl
 )
+
+# Option B (faster): race and drop bad configs early — uncomment and comment out Option A
+# ctrl_race <- control_race(parallel_over = "resamples")
+# res <- tune_race_anova(
+#   xgb_wf,
+#   resamples = val_rs,
+#   grid = grid,
+#   metrics = metrics,
+#   control = ctrl_race
+# )
 
 #### 11) Select Best Params (PR AUC) ####
 show_best(res, metric = "pr_auc", n = 10)
