@@ -335,7 +335,7 @@ df_full_with_clusters <- el_logged%>%
 
 # Save clusters and IDs to join to modeling df
 write.csv(df_full_with_clusters%>%
-            select(user_id, cluster, week_start_date, week_end_date), file="/Users/karstenwalker/Documents/Modeling/Artifacts/user_clusters_3_5.csv")
+            select(user_id, cluster, week_start_date, week_end_date), file="/Users/karstenwalker/Documents/Modeling/Artifacts/user_clusters_3_10.csv")
 
 write.csv(df_full_with_clusters, file="/Users/karstenwalker/Documents/Modeling/Artifacts/cluster_full_df_3_5.csv")
 

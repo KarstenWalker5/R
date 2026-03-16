@@ -6,9 +6,6 @@ library(dplyr)
 library(arrow)
 library(ingredients)   
 
-# ---------------------------
-# 0) Inputs
-# ---------------------------
 # Store your Google Cloud project ID
 bq_auth()
 
@@ -36,7 +33,7 @@ set.seed(7)
 # Download the results into an R data frame
 el_data <- bq_table_download(tb)%>%
   select(-uid, -reported_user_type, -retained28d, -retained90d, -country_code, -age, -platform, -account_type,
-         -days_until_next_session, -cumulative_lifetime_sessions,
+         -days_until_next_session, -cumulative_lifetime_sessions, -contains("sticky"),
          -is_teacher_with_students, -session_count, -first_session_channel, -last_session_channel,
          -lifetime_sets_created,-never_created,-session_count_7d_avg, -set_pageviews_count_7d_avg, 
          -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)%>%
@@ -222,8 +219,7 @@ write_csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_5
 
 rm(el_data)
 
-# 3) Recipe (boosted-tree friendly; avoid unnecessary transforms)
-# ---------------------------
+# Recipe
 clf_recipe <- recipe(formula(paste(outcome, "~ .")), data = train_data) %>%
   update_role(all_of(c(id_cols, time_col)), new_role = "id") %>%
   step_other(all_nominal_predictors(), threshold = 0.01, other = "other_level") %>%
@@ -232,9 +228,7 @@ clf_recipe <- recipe(formula(paste(outcome, "~ .")), data = train_data) %>%
   step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
   step_zv(all_predictors())
 
-# ---------------------------
 # 4) XGBoost model (fixed params, no tuning)
-# ---------------------------
 cores_to_use <- max(1, parallel::detectCores(logical = FALSE) - 1)
 
 xgb_spec <- boost_tree(

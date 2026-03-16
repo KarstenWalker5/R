@@ -4,8 +4,6 @@ library(doParallel)
 library(DALEX)
 library(dplyr)
 library(ingredients)   
-library(bigrquery)
-library(tidyverse)
 
 # Store your Google Cloud project ID
 bq_auth()
@@ -39,11 +37,11 @@ user_clusters_3_4 <- read_csv("/Users/karstenwalker/Documents/Modeling/Artifacts
     week_start = floor_date(week_start_date, "week", week_start = 1)) %>%
   select(user_id, week_start, cluster)
 
-el_data <- bq_table_download(tb)%>%
+el_data <- bq_table_download(tb)
 
 el_data<-el_data%>%
-  select(-uid, -reported_user_type, -retained28d, -retained90d, -country_code, -age, -platform, -account_type,
-         -days_until_next_session, -cumulative_lifetime_sessions,
+  select(-uid, -reported_user_type, -retained7d, -retained90d, -country_code, -age, -platform, -account_type,
+         -days_until_next_session, -cumulative_lifetime_sessions, -retained28d, -retained90d_sticky,
          -is_teacher_with_students, -session_count, -first_session_channel, -last_session_channel,
          -lifetime_sets_created,-never_created,-session_count_7d_avg, -set_pageviews_count_7d_avg, 
          -had_first_session, -unique_sets_viewed, -set_pageviews_count, -course_count)%>%
@@ -52,7 +50,11 @@ el_data<-el_data%>%
 # Ensure Date types
 el_data <- el_data %>%
   mutate(
-    week_start = floor_date(date, "week", week_start = 1) )%>%
+    week_start = floor_date(date, "week", week_start = 1)  # Monday start
+  )
+
+# Join clusters, no imputation
+el_data <- el_data %>%
   left_join(user_clusters_3_4,
             by = c("user_id", "week_start"))
 
@@ -78,17 +80,17 @@ cat("Users with NO cluster coverage at all:", nrow(DT %>%
                                                      filter(all_missing)), "\n")
 
 cat("Users with -1 cluster assignment:", nrow(DT %>%
-                                                     filter(cluster==-1)%>%
-                                                     summarise(n_missing = n_distinct(user_id))), "\n")
+                                                filter(cluster==-1)%>%
+                                                summarise(n_missing = n_distinct(user_id))), "\n")
 
 rm(DT) 
 
 # Optional: read in saved file
-el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_5.csv")%>%
+el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_10_sticky.csv")%>%
   select(-week_start)
 
 # Set these
-outcome  <- "retained28d"
+outcome  <- "retained28d_sticky"
 
 time_col <- "date"
 
@@ -110,7 +112,8 @@ el_data <- el_data %>%
     !!outcome := factor(.data[[outcome]], levels = c("0", "1"))
   ) %>%
   filter(!is.na(.data[[outcome]])) %>%   # drop censored days
-  arrange(.data[[time_col]])
+  arrange(.data[[time_col]])%>%
+  select(-week_start)
 
 #### USER LEVEL SPLIT ####
 # Sample users into train/val/test (80/10/10)
@@ -143,7 +146,7 @@ stopifnot(length(intersect(unique(train_data$user_id), unique(test_data$user_id)
 stopifnot(length(intersect(unique(validation_data$user_id), unique(test_data$user_id))) == 0)
 
 # Drop original data to save memory
-write_csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_10.csv")
+write_csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_week_3_10_sticky.csv")
 
 rm(el_data)
 
@@ -223,11 +226,10 @@ test_metrics <- bind_rows(metrics_class, metrics_prob)
 
 test_metrics
 
-# Run 1
-# accuracy    binary         0.830
-# roc_auc     binary         0.770
-# pr_auc      binary         0.931
-# mn_log_loss binary         0.400
+# accuracy    binary         0.663
+# roc_auc     binary         0.727
+# pr_auc      binary         0.708
+# mn_log_loss binary         0.609
 
 # Feature importance
 engine_fit <- workflows::extract_fit_engine(fit_train)

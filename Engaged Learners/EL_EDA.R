@@ -20,7 +20,7 @@ project_id <- "compact-sylph-785"
 
 # Define your SQL query (example using a public dataset)
 sql <- "SELECT * 
-        FROM `compact-sylph-785.Karsten.EL_1pct_1yr_LI_dev2`"
+        FROM `compact-sylph-785.Karsten.EL_1yr_1pct_LI_complete_wk_3_4`"
 
 # Run the query
 tb <- bq_project_query(project_id, sql)
@@ -41,7 +41,7 @@ el_data <- bq_table_download(tb)%>%
          -lifetime_sets_created, -contains("engaged"))%>%
   group_by(account_type)%>%
   mutate(z_score = scale(flashcards_questions_answered)) %>%
-  filter(abs(z_score)<3,flashcards_questions_answered>0)%>%
+  filter(abs(z_score)<3)%>%
   ungroup()
 
 # %>%
@@ -186,18 +186,6 @@ cor_retention_ecdf<-cor_ecdf %>%
   filter(str_detect(x, "retained"))
 
 ###### PCA + Clustering ######
-# 1 row per user/wk, probably redundant but a good check
-el_sub<-el_logged%>%
-  group_by(user_id, week)%>%
-  filter(row_number()==1)%>%
-  ungroup()
-
-# Drop columns not used for clustering
-df_entity <- el_sub%>%
-  ungroup() %>%
-  select(-contains("retained"), -contains("week"), -year,
-          -age)
-
 # Create an ID lookup for post-clustering
 ids <- el_logged%>%
   group_by(user_id, week)%>%
@@ -206,7 +194,13 @@ ids <- el_logged%>%
   select(user_id, week)
 
 # Replace NA
-X <- df_entity %>%
+X <- el_logged%>%
+  group_by(user_id, week)%>%
+  filter(row_number()==1)%>%
+  ungroup()%>%
+  ungroup() %>%
+  select(-contains("retained"), -contains("week"), -year,
+         -age) %>%
   select(-user_id) %>%
   select(where(is.numeric)) %>%
   mutate(across(everything(), ~ replace_na(.x, 0)))
@@ -301,7 +295,7 @@ elbow_df <- elbow_df %>%
 # After 6 marginal gains stabilizes at <3%, noise coming to the far right, 5-6 is prob the sweet spot
 
 ### Clustering on PCs
-k_final <- 6
+k_final <- 8
 
 mbk <- ClusterR::MiniBatchKmeans(
   data = X_pcs_full,
@@ -328,7 +322,7 @@ df_clustered_uw <- ids %>%
   distinct(user_id, week, .keep_all = TRUE)   
 
 # Join back to full dataset
-df_full_with_clusters <- el_sub%>%
+df_full_with_clusters <- el_logged%>%
   ungroup() %>%
   inner_join(df_clustered_uw, by = c("user_id", "week"))
 
@@ -386,7 +380,7 @@ lift_by_cluster<-df_full_with_clusters %>%
     r7  = mean(retained7d,  na.rm = TRUE),
     r28 = mean(retained28d, na.rm = TRUE),
     r90 = mean(retained90d, na.rm = TRUE),
-    r28_sticky = mean(retained28d_sticky, na.rm = TRUE),
+     r28_sticky = mean(retained28d_sticky, na.rm = TRUE),
     r90_sticky = mean(retained90d_sticky, na.rm = TRUE),
     .groups = "drop"
   ) %>%
@@ -394,8 +388,8 @@ lift_by_cluster<-df_full_with_clusters %>%
     lift7  = r7  / overall$r7,
     lift28 = r28 / overall$r28,
     lift90 = r90 / overall$r90,
-    r28_sticky / overall$r28_sticky,
-    r90_sticky / overall$r90_sticky
+    lift28_sticky = r28_sticky / overall$r28_sticky,
+    lift90_sticky = r90_sticky / overall$r90_sticky
   ) %>%
   arrange(desc(lift7))
 

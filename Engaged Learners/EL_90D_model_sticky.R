@@ -3,9 +3,8 @@ library(tidymodels)
 library(doParallel)
 library(DALEX)
 library(dplyr)
-library(ingredients)   
+library(ingredients)
 library(bigrquery)
-library(tidyverse)
 
 # Store your Google Cloud project ID
 bq_auth()
@@ -39,10 +38,10 @@ user_clusters_3_4 <- read_csv("/Users/karstenwalker/Documents/Modeling/Artifacts
     week_start = floor_date(week_start_date, "week", week_start = 1)) %>%
   select(user_id, week_start, cluster)
 
-el_data <- bq_table_download(tb)%>%
+el_data <- bq_table_download(tb)
 
 el_data<-el_data%>%
-  select(-uid, -reported_user_type, -retained28d, -retained90d, -country_code, -age, -platform, -account_type,
+  select(-uid, -reported_user_type, -country_code, -age, -platform, -account_type,
          -days_until_next_session, -cumulative_lifetime_sessions,
          -is_teacher_with_students, -session_count, -first_session_channel, -last_session_channel,
          -lifetime_sets_created,-never_created,-session_count_7d_avg, -set_pageviews_count_7d_avg, 
@@ -52,7 +51,11 @@ el_data<-el_data%>%
 # Ensure Date types
 el_data <- el_data %>%
   mutate(
-    week_start = floor_date(date, "week", week_start = 1) )%>%
+    week_start = floor_date(date, "week", week_start = 1)  # Monday start
+  )
+
+# Join clusters, no imputation
+el_data <- el_data %>%
   left_join(user_clusters_3_4,
             by = c("user_id", "week_start"))
 
@@ -78,17 +81,21 @@ cat("Users with NO cluster coverage at all:", nrow(DT %>%
                                                      filter(all_missing)), "\n")
 
 cat("Users with -1 cluster assignment:", nrow(DT %>%
-                                                     filter(cluster==-1)%>%
-                                                     summarise(n_missing = n_distinct(user_id))), "\n")
+                                                filter(cluster==-1)%>%
+                                                summarise(n_missing = n_distinct(user_id))), "\n")
 
 rm(DT) 
 
-# Optional: read in saved file
-el_data<- read.csv(file="/Users/karstenwalker/Documents/Datasets/el_training_3_5.csv")%>%
-  select(-week_start)
+# Optional: write saved file
+el_data<- write.csv(el_data%>%
+                      select(-week_start), 
+                    file="/Users/karstenwalker/Documents/Datasets/el_training_3_11.csv")
+
+el_data<-read_csv("/Users/karstenwalker/Documents/Datasets/el_training_3_11.csv", show_col_types = FALSE)%>%
+  select(-1)
 
 # Set these
-outcome  <- "retained28d"
+outcome  <- "retained90d_sticky"
 
 time_col <- "date"
 
@@ -110,7 +117,8 @@ el_data <- el_data %>%
     !!outcome := factor(.data[[outcome]], levels = c("0", "1"))
   ) %>%
   filter(!is.na(.data[[outcome]])) %>%   # drop censored days
-  arrange(.data[[time_col]])
+  arrange(.data[[time_col]])%>%
+  select(-retained7d, -retained90d, -retained28d, -retained28d_sticky,-week_start)
 
 #### USER LEVEL SPLIT ####
 # Sample users into train/val/test (80/10/10)
@@ -143,9 +151,12 @@ stopifnot(length(intersect(unique(train_data$user_id), unique(test_data$user_id)
 stopifnot(length(intersect(unique(validation_data$user_id), unique(test_data$user_id))) == 0)
 
 # Drop original data to save memory
-write_csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_10.csv")
+# write_csv(el_data, file="/Users/karstenwalker/Documents/Datasets/el_training_3_11_sticky90.csv")
 
 rm(el_data)
+
+# Set weights
+spw <- sum(train_data$retained90d_sticky == 1) / sum(train_data$retained90d_sticky == 0)
 
 # 3) Recipe 
 clf_recipe <- recipe(formula(paste(outcome, "~ .")), data = train_data) %>%
@@ -159,12 +170,54 @@ clf_recipe <- recipe(formula(paste(outcome, "~ .")), data = train_data) %>%
 # XGBoost model (fixed params, no tuning)
 cores_to_use <- max(1, parallel::detectCores(logical = FALSE) - 1)
 
-xgb_spec <- boost_tree(
-  trees = 500,          
-  learn_rate = 0.1,
+# xgb_spec <- boost_tree(
+#   trees = 500,          
+#   learn_rate = 0.1,
+#   tree_depth = 3,
+#   min_n = 20,
+#   loss_reduction = 0.0,
+#   sample_size = 0.8,
+#   mtry = 0.8
+# ) %>%
+#   set_mode("classification") %>%
+#   set_engine(
+#     "xgboost",
+#     objective = "binary:logistic",
+#     eval_metric = "auc",
+#     counts = FALSE,     
+#     scale_pos_weight = spw,
+#     nthread = cores_to_use, 
+#     verbose = 1
+#   )
+# 
+# # Alternate spec, add SPW
+# xgb_spec_spw <- boost_tree(
+#   trees = 500,          
+#   learn_rate = 0.1,
+#   tree_depth = 3,
+#   min_n = 20,
+#   loss_reduction = 0.0,
+#   sample_size = 0.8,
+#   mtry = 0.8
+# ) %>%
+#   set_mode("classification") %>%
+#   set_engine(
+#     "xgboost",
+#     objective = "binary:logistic",
+#     eval_metric = "auc",
+#     scale_pos_weight = spw,
+#     early_stopping_rounds=50,
+#     counts = FALSE,     
+#     nthread = cores_to_use, 
+#     verbose = 1
+#   )
+
+# Alternate spec, early stopping, more boosting rounds
+xgb_spec_early <- boost_tree(
+  trees = 2000,         
+  learn_rate = 0.05,
   tree_depth = 3,
   min_n = 20,
-  loss_reduction = 0.0,
   sample_size = 0.8,
   mtry = 0.8
 ) %>%
@@ -172,15 +225,17 @@ xgb_spec <- boost_tree(
   set_engine(
     "xgboost",
     objective = "binary:logistic",
-    eval_metric = "auc",
+    eval_metric = c("auc", "aucpr"),
     counts = FALSE,     
-    nthread = cores_to_use, 
+    nthread = cores_to_use,
+    scale_pos_weight = spw,
+    early_stopping_rounds = 50,
     verbose = 1
   )
 
 clf_wf <- workflow() %>%
   add_recipe(clf_recipe) %>%
-  add_model(xgb_spec)
+  add_model(xgb_spec_early)
 
 fit_train <- fit(clf_wf, data = train_data)
 
@@ -223,17 +278,29 @@ test_metrics <- bind_rows(metrics_class, metrics_prob)
 
 test_metrics
 
-# Run 1
-# accuracy    binary         0.830
-# roc_auc     binary         0.770
-# pr_auc      binary         0.931
-# mn_log_loss binary         0.400
+# Run 1 w/ clusters
+# accuracy    binary         0.679
+# roc_auc     binary         0.738
+# pr_auc      binary         0.668
+# mn_log_loss binary         0.592
+
+# Run 2 w/o clusters
+# accuracy    binary         0.679
+# roc_auc     binary         0.738
+# pr_auc      binary         0.668
+# mn_log_loss binary         0.592
+
+# Run 3 increase tree depth
+# accuracy    binary         0.679
+# roc_auc     binary         0.740
+# pr_auc      binary         0.669
+# mn_log_loss binary         0.590
 
 # Feature importance
 engine_fit <- workflows::extract_fit_engine(fit_train)
 
 vip::vip(engine_fit, num_features = 50) +
-  labs(title = "28D Retention Model Feature Importance")+
+  labs(title = "90D Sticky Retention Model Feature Importance")+
   theme_minimal()
 
 # 3) Confusion matrix

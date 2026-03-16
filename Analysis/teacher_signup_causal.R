@@ -229,6 +229,35 @@ p3 <- ggplot(ci_df, aes(x = date)) +
 # Stack panels
 (p1 / p2 / p3) + plot_layout(heights = c(1.2, 1, 1))
 
+
+###### Premium Access ######
+teacher_data <- teacher_data %>%
+  mutate(premium_access = paid + verified)
+
+pre_period  <- c(min(teacher_data$date), rollout_date - 1)
+
+post_period <- c(rollout_date, max(teacher_data$date))
+
+# Calendar covariates
+X <- model.matrix(~ dow + woy, data = teacher_data)
+X <- X[, -1, drop = FALSE]
+colnames(X) <- make.names(colnames(X), unique = TRUE)
+
+impact_mat <- zoo(
+  cbind(premium_access = teacher_data$premium_access, X),
+  order.by = teacher_data$date
+)
+
+impact_premium <- CausalImpact(
+  impact_mat,
+  pre_period,
+  post_period,
+  model.args = list(
+    nseasons = 7,
+    season.duration = 1))
+
+summary(impact_premium)
+
 ###### Substitution Effect ######
 
 # prep data
